@@ -1,1 +1,68 @@
+# ============================================
+# AGENTE AI FINANZIARIO - Monitoraggio Notizie
+# ============================================
+
+# 1. IMPORT: diciamo al computer quali "librerie" usare
+#    (sono come strumenti pre-fabbricati)
+import feedparser      # Legge i feed RSS (notizie)
+import requests      # Fa richieste a internet
+import os            # Legge variabili d'ambiente (password sicure)
+from datetime import datetime
+
+# 2. CONFIGURAZIONE: impostiamo i "parametri" dell'agente
+#    Questi valori li prenderemo da GitHub Secrets (sicuro)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# 3. FONTI NOTIZIE: lista di feed RSS finanziari affidabili
+#    feedparser legge questi URL e restituisce le notizie
+SOURCES = [
+    "https://www.ft.com/rss/home/global",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://www.reuters.com/rssFeed/businessNews",
+    "https://www.ilsole24ore.com/rss/finanza.xml",
+]
+
+# 4. FUNZIONE PRINCIPALE: il "motore" dell'agente
+def main():
+    # 4a. Raccoglie le notizie da tutte le fonti
+    all_news = []
+    for url in SOURCES:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:3]:
+            all_news.append({
+                "title": entry.title,
+                "link": entry.link,
+                "source": url
+            })
+
+    # 4b. Seleziona le top 5 notizie
+    top_news = all_news[:5]
+
+    # 4c. Crea il messaggio formattato
+    message = "📰 <b>Notizie Finanziarie del Giorno</b>\n\n"
+    message += f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n"
+
+    for i, news in enumerate(top_news, 1):
+        message += f"{i}. {news['title']}\n"
+        message += f"   🔗 {news['link']}\n\n"
+
+    # 4d. Invia su Telegram
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    response = requests.post(url, json=payload)
+
+    # 4e. Verifica che tutto sia andato bene
+    if response.status_code == 200:
+        print("✅ Messaggio inviato con successo!")
+    else:
+        print(f"❌ Errore: {response.text}")
+
+# 5. AVVIO: quando il file viene eseguito, parte da qui
+if __name__ == "__main__":
+    main()
 
