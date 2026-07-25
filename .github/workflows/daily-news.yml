@@ -1,7 +1,10 @@
-name: Advanced Finance AI Agent with Visual Charts
+name: Advanced Finance AI Agent - Trading Levels
 
 on:
   schedule:
+    # Ogni 4 ore: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    # In Italia: 02:00, 06:00, 10:00, 14:00, 18:00, 22:00 (ora solare)
+    # In Italia estate: 02:00, 06:00, 10:00, 14:00, 18:00, 22:00 (ora legale)
     - cron: '0 */4 * * *'
   workflow_dispatch:
 
@@ -11,20 +14,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           pip install feedparser requests matplotlib
-      
-      - name: Run visual chart agent
+
+      - name: Run advanced trading agent
         run: python agent.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
 
      
