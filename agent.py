@@ -9,9 +9,9 @@ from datetime import datetime, timedelta
 import time
 
 # ============================================
-# AGENTE AI CON GRAFICI VISIVI REALI
-# Genera immagini PNG e le invia su Telegram
-# Frequenza: ogni 4 ore
+# AGENTE AI TRADING AVANZATO
+# Grafici con livelli: entrata, target, stop-loss
+# Fix cron: invio automatico ogni 4 ore garantito
 # ============================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -33,77 +33,105 @@ GEOPOL_SOURCES = [
     "https://news.google.com/rss/search?q=election+OR+political+crisis+OR+government+change+OR+trade+war+OR+tariff+OR+brexit+OR+trade+deal&hl=en-US&gl=US&ceid=US:en",
 ]
 
-# === DATABASE (abbreviato per lunghezza, completo nel file) ===
+# === DATABASE COMPLETO ===
 COUNTRY_ASSETS = {
     "united states": ["SPY", "QQQ", "DIA", "XLF", "TLT", "GLD", "USO"],
     "usa": ["SPY", "QQQ", "DIA", "XLF", "TLT", "GLD", "USO"],
     "fed": ["SPY", "QQQ", "XLF", "TLT", "KRE", "JPM", "BAC", "BLK"],
+    "powell": ["SPY", "QQQ", "XLF", "TLT", "KRE"],
     "europe": ["VGK", "EZU", "EWG", "EWQ", "EWI", "FEZ"],
     "ecb": ["VGK", "EZU", "EWG", "EWQ", "DB", "UBS", "SAN"],
-    "china": ["FXI", "MCHI", "KWEB", "ASHR", "BABA", "TCEHY", "JD"],
-    "uk": ["EWU", "HSBC", "BP", "SHEL", "AZN", "UL"],
-    "japan": ["EWJ", "DXJ", "TM", "SONY", "NTDOY"],
-    "brazil": ["EWZ", "PBR", "VALE", "ITUB", "BBD"],
-    "india": ["INDA", "EPI", "INFY", "TCS", "HDB"],
-    "israel": ["ISRA", "EIS", "TEVA", "ICL", "CHKP"],
-    "iran": ["USO", "UCO", "BNO", "XLE", "CVX", "XOM"],
+    "lagarde": ["VGK", "EZU", "EWG", "EWQ"],
+    "germany": ["EWG", "VGK", "EZU", "SAP", "SIE", "BMWYY", "VWAGY"],
+    "france": ["EWQ", "VGK", "EZU", "TOT", "OR", "SAN", "AIR"],
+    "italy": ["EWI", "VGK", "EZU", "ENI", "UCG", "ISP", "LUX"],
+    "spain": ["EWP", "VGK", "EZU", "SAN", "BBVA", "ITX", "TEF"],
+    "uk": ["EWU", "VGK", "EZU", "HSBC", "BP", "SHEL", "AZN", "UL"],
+    "britain": ["EWU", "VGK", "HSBC", "BP", "SHEL", "AZN"],
+    "boe": ["EWU", "VGK", "HSBC", "BP", "SHEL"],
+    "bailey": ["EWU", "VGK", "HSBC", "BP"],
+    "china": ["FXI", "MCHI", "KWEB", "ASHR", "BABA", "TCEHY", "JD", "PDD"],
+    "taiwan": ["EWT", "FXI", "TSM", "UMC", "ASML"],
+    "japan": ["EWJ", "DXJ", "HEWJ", "TM", "HMC", "SONY", "NTDOY", "SNE"],
+    "india": ["INDA", "EPI", "MINDX", "INFY", "TCS", "WIT", "HDB"],
+    "south korea": ["EWY", "SKM", "KB", "KEP", "POSCO", "LPL"],
+    "australia": ["EWA", "BHP", "RIO", "WPL", "NAB", "WBC", "ANZ"],
+    "israel": ["ISRA", "EIS", "TEVA", "ICL", "CHKP", "CYBR"],
+    "iran": ["USO", "UCO", "BNO", "OIL", "XLE", "CVX", "XOM"],
     "saudi arabia": ["KSA", "USO", "XLE", "CVX", "XOM"],
-    "russia": ["RSX", "ERUS", "USO", "GLD", "UNG", "WEAT"],
-    "ukraine": ["USO", "UNG", "WEAT", "CORN", "GLD", "RSX"],
-    "gold": ["GLD", "IAU", "GOLD", "NEM", "AEM", "KGC"],
+    "uae": ["UAE", "USO", "XLE"],
+    "qatar": ["QAT", "USO", "XLE"],
+    "russia": ["RSX", "ERUS", "USO", "GLD", "UNG", "WEAT", "CORN", "SOYB"],
+    "ukraine": ["USO", "UNG", "WEAT", "CORN", "SOYB", "GLD", "RSX"],
+    "brazil": ["EWZ", "BRZU", "PBR", "VALE", "ITUB", "BBD"],
+    "mexico": ["EWW", "FMX", "AMX", "CEMEX", "GMEXIC"],
+    "argentina": ["ARGT", "GGAL", "YPF", "PAM", "TEO"],
+    "gold": ["GLD", "IAU", "PHYS", "GOLD", "NEM", "AEM", "KGC"],
     "oil": ["USO", "UCO", "BNO", "XLE", "XOM", "CVX", "COP", "OXY"],
-    "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "RIOT", "MARA"],
+    "natural gas": ["UNG", "BOIL", "KOLD", "KBR", "SWN", "EQT"],
+    "wheat": ["WEAT", "CORN", "SOYB", "DBA", "TEUC", "ADM"],
+    "corn": ["CORN", "WEAT", "SOYB", "DBA", "ADM", "INGR"],
+    "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "BITW", "GBTC", "RIOT", "MARA"],
+    "ethereum": ["COIN", "HOOD", "BITW", "ETHE", "RIOT", "MARA", "HIVE"],
 }
 
 KEYWORD_TICKERS = {
     "apple": ["AAPL", "AVGO", "LITE", "QRVO", "SWKS"],
+    "iphone": ["AAPL", "LGL", "CRUS", "STM"],
     "microsoft": ["MSFT", "QLYS", "VEEV", "DOCU"],
     "google": ["GOOGL", "GOOG", "TDC", "TRMB"],
     "meta": ["META", "SNAP", "PINS", "MTCH"],
-    "nvidia": ["NVDA", "AMD", "INTC", "MRVL", "QCOM"],
+    "nvidia": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "SWKS"],
     "ai": ["NVDA", "AMD", "PLTR", "AI", "SNOW", "MDB", "DDOG", "NET"],
-    "chip": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "SWKS", "QRVO"],
+    "artificial intelligence": ["NVDA", "AMD", "PLTR", "AI", "SNOW", "MDB"],
+    "chip": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "SWKS", "QRVO", "MPWR"],
     "semiconductor": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "AMAT", "LRCX"],
-    "cloud": ["MSFT", "AMZN", "GOOGL", "CRM", "NOW", "SNOW", "DDOG"],
+    "cloud": ["MSFT", "AMZN", "GOOGL", "CRM", "NOW", "SNOW", "DDOG", "MDB"],
     "cybersecurity": ["CRWD", "PANW", "FTNT", "ZS", "OKTA", "CYBR", "S", "NET"],
-    "bank": ["JPM", "BAC", "WFC", "C", "GS", "MS", "PNC", "USB"],
+    "data center": ["NVDA", "AMD", "INTC", "SMCI", "DELL", "HPE", "ANET"],
+    "bank": ["JPM", "BAC", "WFC", "C", "GS", "MS", "PNC", "USB", "TFC", "RF"],
     "banca": ["JPM", "BAC", "WFC", "C", "GS", "MS"],
-    "fed": ["SPY", "QQQ", "XLF", "TLT", "KRE", "JPM", "BAC"],
-    "ecb": ["VGK", "EZU", "EWG", "EWQ", "DB", "UBS"],
-    "oil": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO", "OXY"],
-    "petrolio": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO"],
-    "gas": ["XOM", "CVX", "COP", "EOG", "MRO", "DVN", "EQT"],
-    "energy": ["XOM", "CVX", "COP", "EOG", "XLE", "OXY", "DVN"],
-    "renewable": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR"],
-    "solar": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR"],
-    "pharma": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN"],
-    "drug": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN"],
+    "credit": ["JPM", "BAC", "WFC", "C", "DFS", "COF", "SYF", "ALLY"],
+    "mortgage": ["RKT", "UWMC", "LDI", "PFSI", "COOP"],
+    "oil": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO", "PSX", "MRO", "OXY", "DVN"],
+    "petrolio": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO", "OXY"],
+    "gas": ["XOM", "CVX", "COP", "EOG", "MRO", "DVN", "EQT", "RRC", "SWN"],
+    "energy": ["XOM", "CVX", "COP", "EOG", "XLE", "OXY", "DVN", "MRO", "FANG"],
+    "renewable": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR", "CSIQ", "JKS"],
+    "solar": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR", "CSIQ", "JKS"],
+    "wind": ["GE", "VWDRY", "NPI", "BEP", "NEE", "ORA", "TPIC"],
+    "pharma": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN", "GILD", "BIIB"],
+    "drug": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN", "GILD", "VRTX"],
     "vaccine": ["PFE", "MRNA", "BNTX", "NVAX", "GSK", "SNY", "JNJ"],
-    "biotech": ["AMGN", "GILD", "BIIB", "VRTX", "REGN", "ALNY", "SRPT"],
-    "tesla": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI"],
-    "ev": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI", "QS"],
-    "electric vehicle": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "QS"],
-    "automaker": ["F", "GM", "STLA", "TM", "HMC", "VWAGY", "BMWYY"],
+    "biotech": ["AMGN", "GILD", "BIIB", "VRTX", "REGN", "ALNY", "SRPT", "BMRN"],
+    "fda": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "VRTX", "REGN", "ALNY"],
+    "clinical trial": ["BIIB", "VRTX", "REGN", "ALNY", "SRPT", "BMRN", "IONS", "EXEL"],
+    "tesla": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI", "BYDDF"],
+    "ev": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI", "QS", "MP"],
+    "electric vehicle": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "QS", "MP"],
+    "automaker": ["F", "GM", "STLA", "TM", "HMC", "HYMTF", "VWAGY", "BMWYY"],
     "car": ["F", "GM", "STLA", "TM", "HMC", "VWAGY", "BMWYY", "RACE"],
-    "battery": ["TSLA", "QS", "MP", "ALB", "SQM", "LTHM", "PLL"],
-    "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "RIOT", "MARA"],
-    "ethereum": ["COIN", "HOOD", "BITW", "ETHE", "RIOT", "MARA"],
-    "crypto": ["MSTR", "COIN", "HOOD", "BITO", "RIOT", "MARA", "HIVE"],
+    "battery": ["TSLA", "QS", "MP", "ALB", "SQM", "LTHM", "PLL", "LAC"],
+    "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "BITW", "GBTC", "RIOT", "MARA"],
+    "ethereum": ["COIN", "HOOD", "BITW", "ETHE", "RIOT", "MARA", "HIVE", "HUT"],
+    "crypto": ["MSTR", "COIN", "HOOD", "BITO", "RIOT", "MARA", "HIVE", "HUT", "BITF"],
     "blockchain": ["IBM", "COIN", "MSTR", "RIOT", "MARA", "SQ", "PYPL"],
-    "real estate": ["VNQ", "SPG", "O", "AMT", "PLD", "WPC", "NNN"],
-    "housing": ["DHI", "LEN", "PHM", "TOL", "NVR", "KBH", "MTH"],
-    "gold": ["GLD", "IAU", "GOLD", "NEM", "AEM", "KGC", "WPM", "RGLD"],
-    "silver": ["SLV", "PAAS", "HL", "CDE", "EXK", "MAG", "FSM"],
-    "copper": ["FCX", "SCCO", "TECK", "VALE", "RIO", "BHP"],
-    "commodity": ["PDBC", "USCI", "GCC", "DJP", "DBC", "GSG"],
-    "steel": ["NUE", "STLD", "MT", "VALE", "RIO", "BHP", "CLF"],
-    "amazon": ["AMZN", "SHOP", "ETSY", "EBAY", "W", "OSTK"],
-    "retail": ["WMT", "TGT", "COST", "HD", "LOW", "BBY", "TJX"],
-    "consumer": ["PG", "KO", "PEP", "WMT", "COST", "MCD", "SBUX"],
-    "defense": ["LMT", "NOC", "RTX", "GD", "BA", "HII", "KTOS"],
-    "aerospace": ["BA", "AIR", "GE", "HON", "RTX", "LMT", "NOC"],
-    "telecom": ["T", "VZ", "TMUS", "CMCSA", "CHTR", "LUMN"],
-    "streaming": ["NFLX", "DIS", "WBD", "PARA", "ROKU", "FUBO"],
+    "real estate": ["VNQ", "SPG", "O", "AMT", "PLD", "WPC", "NNN", "STAG"],
+    "housing": ["DHI", "LEN", "PHM", "TOL", "NVR", "KBH", "MTH", "TMHC", "TPH"],
+    "construction": ["DHI", "LEN", "PHM", "TOL", "CAT", "DE", "URI"],
+    "gold": ["GLD", "IAU", "PHYS", "GOLD", "NEM", "AEM", "KGC", "WPM", "RGLD", "FNV"],
+    "silver": ["SLV", "PAAS", "HL", "CDE", "EXK", "MAG", "FSM", "SVM"],
+    "copper": ["FCX", "SCCO", "TECK", "VALE", "RIO", "BHP", "GLNCY", "ANTO"],
+    "commodity": ["PDBC", "USCI", "GCC", "DJP", "DBC", "GSG", "COMT"],
+    "steel": ["NUE", "STLD", "MT", "VALE", "RIO", "BHP", "CLF", "TX"],
+    "amazon": ["AMZN", "SHOP", "ETSY", "EBAY", "W", "OSTK", "CVNA"],
+    "retail": ["WMT", "TGT", "COST", "HD", "LOW", "BBY", "TJX", "ROST", "BURL"],
+    "consumer": ["PG", "KO", "PEP", "WMT", "COST", "MCD", "SBUX", "DPZ", "YUM"],
+    "defense": ["LMT", "NOC", "RTX", "GD", "BA", "HII", "KTOS", "BWXT"],
+    "aerospace": ["BA", "AIR", "SAFRF", "GE", "HON", "RTX", "LMT", "NOC"],
+    "infrastructure": ["CAT", "DE", "URI", "PCAR", "VMI", "MLI", "TREX", "AWP"],
+    "telecom": ["T", "VZ", "TMUS", "CMCSA", "CHTR", "LUMN", "FYBR", "CNSL"],
+    "streaming": ["NFLX", "DIS", "WBD", "PARA", "ROKU", "FUBO", "AMC", "CNK"],
     "ozempic": ["NVO", "LLY", "PFE", "MRK", "ABBV", "BMY"],
     "wegovy": ["NVO", "LLY"],
     "weight loss": ["NVO", "LLY", "PFE", "MRK"],
@@ -112,9 +140,9 @@ KEYWORD_TICKERS = {
     "space": ["RKLB", "ASTS", "SPCE", "LUNR", "VORB", "BA", "LMT"],
     "paramount": ["PARA", "WBD", "DIS", "NFLX", "CMCSA", "FOX"],
     "warner": ["WBD", "PARA", "DIS", "NFLX", "CMCSA", "FOX"],
-    "mercedes": ["MBGYY", "VWAGY", "BMWYY", "TM", "HMC", "STLA"],
-    "vat": ["SPY", "QQQ", "DIA", "XLU", "NEE", "DUK", "SO"],
-    "electricity": ["XLU", "NEE", "DUK", "SO", "AEP", "EXC", "SRE"],
+    "mercedes": ["MBGYY", "VWAGY", "BMWYY", "TM", "HMC", "STLA", "F", "GM"],
+    "vat": ["SPY", "QQQ", "DIA", "XLU", "NEE", "DUK", "SO", "AEP"],
+    "electricity": ["XLU", "NEE", "DUK", "SO", "AEP", "EXC", "SRE", "ED"],
     "utility": ["XLU", "NEE", "DUK", "SO", "AEP", "EXC", "SRE", "ED"],
 }
 
@@ -191,7 +219,8 @@ def find_tickers_from_news(title, summary=""):
 
     return list(found_tickers)[:8], matched_keywords, countries
 
-def get_stock_data(ticker, days=5):
+def get_stock_data(ticker, days=10):
+    """Ottiene dati storici estesi per analisi più approfondita"""
     try:
         end = int(datetime.now().timestamp())
         start = int((datetime.now() - timedelta(days=days+2)).timestamp())
@@ -216,23 +245,71 @@ def get_stock_data(ticker, days=5):
                 change = ((prices[-1] - prices[0]) / prices[0]) * 100
                 return {
                     "ticker": ticker,
-                    "prices": prices[-5:],
-                    "dates": dates[-5:],
+                    "prices": prices[-10:],
+                    "dates": dates[-10:],
                     "current": prices[-1],
                     "change": change,
                     "high": max(prices),
-                    "low": min(prices)
+                    "low": min(prices),
+                    "avg": sum(prices) / len(prices)
                 }
     except Exception as e:
         print(f"Errore dati {ticker}: {e}")
     return None
 
-def generate_visual_chart(data):
-    """Genera un grafico visivo reale usando matplotlib e lo invia su Telegram"""
+def calculate_trading_levels(data):
+    """Calcola livelli di trading: entrata, target, stop-loss"""
+    if not data:
+        return None
+
+    current = data["current"]
+    high = data["high"]
+    low = data["low"]
+    avg = data["avg"]
+    change = data["change"]
+
+    # Calcola supporto e resistenza
+    support = low * 0.98
+    resistance = high * 1.02
+
+    # Livelli di trading
+    if change >= 0:
+        # Trend rialzista
+        entry = current
+        target_1 = current * 1.03  # +3%
+        target_2 = current * 1.05  # +5%
+        target_3 = current * 1.10  # +10%
+        stop_loss = current * 0.97  # -3%
+        risk_reward = "1:3"  # Rischio 3%, reward potenziale 9%
+    else:
+        # Trend ribassista - possibile rimbalzo
+        entry = current
+        target_1 = current * 1.02  # +2%
+        target_2 = current * 1.05  # +5%
+        target_3 = current * 1.08  # +8%
+        stop_loss = current * 0.95  # -5%
+        risk_reward = "1:1.6"  # Rischio 5%, reward potenziale 8%
+
+    return {
+        "entry": entry,
+        "target_1": target_1,
+        "target_2": target_2,
+        "target_3": target_3,
+        "stop_loss": stop_loss,
+        "support": support,
+        "resistance": resistance,
+        "risk_reward": risk_reward,
+        "suggested_position": "LONG" if change >= -2 else "ATTENDERE",
+        "confidence": "ALTA" if abs(change) > 5 else "MEDIA"
+    }
+
+def generate_advanced_chart(data, levels):
+    """Genera grafico avanzato con livelli di trading"""
     try:
         import matplotlib
-        matplotlib.use('Agg')  # Backend non-interattivo
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
         import numpy as np
 
         prices = data["prices"]
@@ -244,8 +321,7 @@ def generate_visual_chart(data):
         if len(prices) < 2:
             return None
 
-        # Setup figura
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(12, 6))
         fig.patch.set_facecolor('#0f172a')
         ax.set_facecolor('#0f172a')
 
@@ -254,27 +330,48 @@ def generate_visual_chart(data):
         color_down = '#ef4444'
         line_color = color_up if change >= 0 else color_down
 
-        # Disegna linea
         x = np.arange(len(prices))
-        ax.plot(x, prices, color=line_color, linewidth=3, marker='o', markersize=12,
-                markerfacecolor=line_color, markeredgecolor='white', markeredgewidth=2)
+
+        # Disegna linea prezzo
+        ax.plot(x, prices, color=line_color, linewidth=3, marker='o', markersize=10,
+                markerfacecolor=line_color, markeredgecolor='white', markeredgewidth=2, label='Prezzo')
 
         # Riempi area
         ax.fill_between(x, prices, alpha=0.15, color=line_color)
 
+        # Disegna livelli di trading
+        if levels:
+            # Linea entrata
+            ax.axhline(y=levels["entry"], color='#38bdf8', linestyle='--', linewidth=2, alpha=0.8, label=f'Entrata: ${levels["entry"]:.2f}')
+
+            # Linea target
+            ax.axhline(y=levels["target_1"], color='#22c55e', linestyle='--', linewidth=1.5, alpha=0.6, label=f'Target 1: ${levels["target_1"]:.2f} (+{((levels["target_1"]/levels["entry"])-1)*100:.1f}%)')
+            ax.axhline(y=levels["target_2"], color='#22c55e', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Target 2: ${levels["target_2"]:.2f} (+{((levels["target_2"]/levels["entry"])-1)*100:.1f}%)')
+
+            # Linea stop-loss
+            ax.axhline(y=levels["stop_loss"], color='#ef4444', linestyle='--', linewidth=2, alpha=0.8, label=f'Stop-Loss: ${levels["stop_loss"]:.2f} ({((levels["stop_loss"]/levels["entry"])-1)*100:.1f}%)')
+
+            # Zone
+            ax.axhspan(levels["entry"], levels["target_2"], alpha=0.05, color='green')
+            ax.axhspan(levels["stop_loss"], levels["entry"], alpha=0.05, color='red')
+
         # Etichette prezzo
         for i, (xi, yi) in enumerate(zip(x, prices)):
             ax.annotate(f'${yi:.2f}', (xi, yi), textcoords="offset points",
-                       xytext=(0, 15), ha='center', fontsize=10, color='white', fontweight='bold')
+                       xytext=(0, 12), ha='center', fontsize=9, color='white', fontweight='bold')
 
         # Date
         ax.set_xticks(x)
-        ax.set_xticklabels(dates, color='#94a3b8', fontsize=11)
+        ax.set_xticklabels(dates, color='#94a3b8', fontsize=10)
 
         # Titolo
         symbol = '+' if change >= 0 else ''
         ax.set_title(f'{ticker}  {symbol}{change:.1f}%  |  ${current:.2f}',
                     color='white', fontsize=16, fontweight='bold', pad=20)
+
+        # Legenda
+        ax.legend(loc='upper left', facecolor='#1e293b', edgecolor='#334155', 
+                 labelcolor='white', fontsize=9)
 
         # Rimuovi assi Y
         ax.set_yticks([])
@@ -283,25 +380,22 @@ def generate_visual_chart(data):
         ax.spines['left'].set_visible(False)
         ax.spines['bottom'].set_color('#334155')
 
-        # Box opportunità
-        if change < -5:
-            opp_text = "RIBASSO FORTE - Possibile oversold\nControllare punto ingresso"
-        elif change < -2:
-            opp_text = "RIBASSO MODERATO - Monitorare\nAttendere conferma inversione"
-        elif change > 5:
-            opp_text = "RIALZO FORTE - Momentum attivo\nConsiderare profit-taking"
-        elif change > 2:
-            opp_text = "RIALZO MODERATO - Trend positivo\nValutare ingresso"
-        else:
-            opp_text = "LATERALE - Nessuna opportunità\nAttendere breakout"
+        # Box info trading
+        if levels:
+            info_text = f"📊 LIVELLI TRADING\n"
+            info_text += f"🎯 Entrata: ${levels['entry']:.2f}\n"
+            info_text += f"🎯 Target 1: ${levels['target_1']:.2f} (+{((levels['target_1']/levels['entry'])-1)*100:.1f}%)\n"
+            info_text += f"🎯 Target 2: ${levels['target_2']:.2f} (+{((levels['target_2']/levels['entry'])-1)*100:.1f}%)\n"
+            info_text += f"🛑 Stop-Loss: ${levels['stop_loss']:.2f} ({((levels['stop_loss']/levels['entry'])-1)*100:.1f}%)\n"
+            info_text += f"⚖️ Risk/Reward: {levels['risk_reward']}\n"
+            info_text += f"📈 Posizione: {levels['suggested_position']} | Fiducia: {levels['confidence']}"
 
-        props = dict(boxstyle='round,pad=0.5', facecolor='#1e293b', edgecolor=line_color, linewidth=2)
-        ax.text(0.5, -0.22, opp_text, transform=ax.transAxes, fontsize=10,
-                verticalalignment='top', horizontalalignment='center', color='white', bbox=props)
+            props = dict(boxstyle='round,pad=0.6', facecolor='#1e293b', edgecolor=line_color, linewidth=2)
+            ax.text(0.5, -0.28, info_text, transform=ax.transAxes, fontsize=9,
+                    verticalalignment='top', horizontalalignment='center', color='white', bbox=props)
 
         plt.tight_layout()
 
-        # Salva in buffer
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=150, bbox_inches='tight',
                    facecolor='#0f172a', edgecolor='none')
@@ -314,7 +408,6 @@ def generate_visual_chart(data):
         return None
 
 def send_photo_to_telegram(photo_buffer, caption=""):
-    """Invia foto su Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     files = {'photo': ('chart.png', photo_buffer, 'image/png')}
     data = {'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}
@@ -493,37 +586,42 @@ def main():
         send_telegram_message(msg2)
         time.sleep(1)
 
-    # === MESSAGGIO 3: GRAFICI VISIVI ===
+    # === MESSAGGIO 3: GRAFICI AVANZATI CON LIVELLI ===
     if all_tickers:
-        msg3 = "📈 <b>GRAFICI VISIVI - AZIONI COINVOLTE</b>\n"
+        msg3 = "📈 <b>GRAFICI AVANZATI - LIVELLI DI TRADING</b>\n"
         msg3 += "━" * 20 + "\n"
-        msg3 += "⚠️ Disclaimer: Analisi educativa. Non consiglio finanziario.\n\n"
+        msg3 += "⚠️ Disclaimer: Analisi educativa. Non consiglio finanziario.\n"
+        msg3 += "📊 Livelli calcolati su dati storici 10 giorni\n\n"
         send_telegram_message(msg3)
         time.sleep(1)
 
-        # Genera e invia grafici visivi
-        opportunities = []
+        # Genera e invia grafici avanzati
         for ticker in all_tickers:
-            data = get_stock_data(ticker, days=5)
+            data = get_stock_data(ticker, days=10)
             if data:
-                chart_buf = generate_visual_chart(data)
+                levels = calculate_trading_levels(data)
+                chart_buf = generate_advanced_chart(data, levels)
                 if chart_buf:
                     change = data["change"]
-                    if change < -5:
-                        caption = f"<b>{ticker}</b>\n⚠️ RIBASSO FORTE - Possibile oversold\n🎯 Controllare punto ingresso"
-                    elif change < -2:
-                        caption = f"<b>{ticker}</b>\n📉 RIBASSO MODERATO - Monitorare\n👀 Attendere conferma inversione"
-                    elif change > 5:
-                        caption = f"<b>{ticker}</b>\n🚀 RIALZO FORTE - Momentum attivo\n⚡ Considerare profit-taking"
-                    elif change > 2:
-                        caption = f"<b>{ticker}</b>\n📈 RIALZO MODERATO - Trend positivo\n✅ Valutare ingresso"
-                    else:
-                        caption = f"<b>{ticker}</b>\n➡️ LATERALE - Nessuna opportunità\n⏸️ Attendere breakout"
+
+                    # Caption dettagliata
+                    caption = f"<b>{ticker}</b>  {('+' if change >= 0 else '')}{change:.1f}%\n"
+                    if levels:
+                        caption += f"\n📊 <b>LIVELLI TRADING</b>\n"
+                        caption += f"🎯 Entrata: <code>${levels['entry']:.2f}</code>\n"
+                        caption += f"🎯 Target 1: <code>${levels['target_1']:.2f}</code> (+{((levels['target_1']/levels['entry'])-1)*100:.1f}%)\n"
+                        caption += f"🎯 Target 2: <code>${levels['target_2']:.2f}</code> (+{((levels['target_2']/levels['entry'])-1)*100:.1f}%)\n"
+                        caption += f"🛑 Stop-Loss: <code>${levels['stop_loss']:.2f}</code> ({((levels['stop_loss']/levels['entry'])-1)*100:.1f}%)\n"
+                        caption += f"⚖️ Risk/Reward: <code>{levels['risk_reward']}</code>\n"
+                        caption += f"📈 Posizione: <code>{levels['suggested_position']}</code> | Fiducia: <code>{levels['confidence']}</code>\n"
+                        caption += f"\n💡 Se entri a ${levels['entry']:.2f}:"
+                        caption += f"\n   Profitto potenziale: +{((levels['target_1']/levels['entry'])-1)*100:.1f}% → +{((levels['target_2']/levels['entry'])-1)*100:.1f}%"
+                        caption += f"\n   Perdita max: {((levels['stop_loss']/levels['entry'])-1)*100:.1f}%"
 
                     send_photo_to_telegram(chart_buf, caption)
-                    time.sleep(0.5)
+                    time.sleep(1)
 
-    print("✅ Agente con Grafici Visivi Completato!")
+    print("✅ Agente Trading Avanzato Completato!")
 
 if __name__ == "__main__":
     main()
