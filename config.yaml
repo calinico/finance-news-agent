@@ -1,5 +1,5 @@
 # ============================================
-# FINANCE NEWS AGENT — CONFIGURAZIONE v3.0
+# FINANCE NEWS AGENT — CONFIGURAZIONE v4.0
 # ============================================
 
 # Intervallo tra cicli (ore)
@@ -42,6 +42,24 @@ trading:
   stop_loss_long_pct: 0.03
   stop_loss_short_pct: 0.05
   valid_days: 7
+
+# Retry configurazione
+retry:
+  max_retries: 3
+  base_delay: 2
+  max_delay: 30
+
+# Watchdog — rileva blocchi
+watchdog:
+  enabled: true
+  timeout_seconds: 1800      # 30 minuti senza heartbeat = blocco
+  check_interval: 300        # Controlla ogni 5 minuti
+  max_restarts: 3            # Max tentativi recovery prima di arrendersi
+
+# Heartbeat
+heartbeat:
+  enabled: true
+  interval_runs: 6           # Invia heartbeat Telegram ogni N cicli
 
 # Fonti Notizie
 sources:
