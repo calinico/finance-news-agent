@@ -1,0 +1,66 @@
+# ============================================
+# FINANCE NEWS AGENT — CONFIGURAZIONE v3.0
+# ============================================
+
+# Intervallo tra cicli (ore)
+run_interval_hours: 4
+
+# Telegram
+telegram:
+  token: "${TELEGRAM_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+
+# Database
+database:
+  path: "agent_data.db"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "agent.log"
+  max_bytes: 1048576
+  backup_count: 5
+
+# Analisi Tecnica — periodi indicatori
+technical:
+  history_days: 30
+  rsi_period: 14
+  sma_short: 20
+  sma_long: 50
+  bb_period: 20
+  bb_std: 2
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+
+# Livelli Trading
+trading:
+  target_1_pct: 0.03
+  target_2_pct: 0.05
+  target_3_pct: 0.10
+  stop_loss_long_pct: 0.03
+  stop_loss_short_pct: 0.05
+  valid_days: 7
+
+# Fonti Notizie
+sources:
+  finance:
+    - "https://www.ft.com/rss/home/global"
+    - "https://feeds.bbci.co.uk/news/business/rss.xml"
+    - "https://www.reuters.com/rssFeed/businessNews"
+    - "https://www.ilsole24ore.com/rss/finanza.xml"
+    - "https://feeds.afr.com/markets/rss"
+    - "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+  geopol:
+    - "https://news.google.com/rss/search?q=war+OR+conflict+OR+geopolitics+OR+tension+OR+sanctions+OR+nato+OR+ukraine+OR+israel+OR+iran+OR+taiwan+OR+china+tension&hl=en-US&gl=US&ceid=US:en"
+    - "https://news.google.com/rss/search?q=fed+speech+OR+ecb+speech+OR+boe+speech+OR+powell+OR+lagarde+OR+bailey+OR+central+bank+OR+interest+rate+decision&hl=en-US&gl=US&ceid=US:en"
+    - "https://news.google.com/rss/search?q=election+OR+political+crisis+OR+government+change+OR+trade+war+OR+tariff+OR+brexit+OR+trade+deal&hl=en-US&gl=US&ceid=US:en"
+
+# Limiti
+limits:
+  max_news_per_source: 2
+  max_finance_news: 5
+  max_geopol_news: 5
+  max_tickers_chart: 8
+  max_tickers_per_news: 4
