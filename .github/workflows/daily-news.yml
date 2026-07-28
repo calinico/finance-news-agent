@@ -29,6 +29,19 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+version: '3.8'
+services:
+  finance-agent:
+    build: .
+    container_name: finance-news-agent
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - RUN_INTERVAL_HOURS=${RUN_INTERVAL_HOURS:-4}
+      - DB_PATH=/app/data/finance_agent.db
+    volumes:
+      - ./data:/app/data
 
 
      
