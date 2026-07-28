@@ -764,7 +764,7 @@ def analyze_volume_trend(volumes: List[int]) -> str:
     return "STABILE"
 
 # ============================================
-# CALCOLO LIVELLI TRADING + CONFIDENCE SCORE
+# CALCOLO LIVELLI TRADING + CONFIDENCE SCORE AVANZATO
 # ============================================
 def calculate_trading_levels(data: Dict) -> Optional[Dict]:
     if not data:
@@ -776,8 +776,202 @@ def calculate_trading_levels(data: Dict) -> Optional[Dict]:
     change = data["change"]
     ohlc = data.get("ohlc", [])
     volumes = data.get("volumes", [])
+    company = data.get("company", data["ticker"])
     tc = CFG.get('technical', {})
     tr = CFG.get('trading', {})
+    
+    # Indicatori
     rsi = calculate_rsi(prices, tc.get('rsi_period', 14))
     sma20 = calculate_sma(prices, tc.get('sma_short', 20))
-    sma50 = calculate_sma(prices, tc.get('s
+    sma50 = calculate_sma(prices, tc.get('sma_long', 50))
+    bb = calculate_bollinger(prices, tc.get('bb_period', 20), tc.get('bb_std', 2))
+    macd = calculate_macd(prices, tc.get('macd_fast', 12), tc.get('macd_slow', 26), tc.get('macd_signal', 9))
+    atr = calculate_atr(ohlc, tc.get('atr_period', 14))
+    vol_trend = analyze_volume_trend(volumes)
+    
+    # Estrai highs/lows per stochastic
+    highs = [c["high"] for c in ohlc] if ohlc else prices
+    lows = [c["low"] for c in ohlc] if ohlc else prices
+    stoch = calculate_stochastic(prices, highs, lows)
+    
+    # Determina trend
+    trend_signals = []
+    if sma20 and sma50:
+        if sma20 > sma50:
+            trend_signals.append("bullish_ma")
+        else:
+            trend_signals.append("bearish_ma")
+    if macd:
+        trend_signals.append(macd["trend"].lower())
+    if rsi is not None:
+        if rsi > 60:
+            trend_signals.append("rsi_bullish")
+        elif rsi < 40:
+            trend_signals.append("rsi_bearish")
+    
+    bullish_count = sum(1 for s in trend_signals if "bullish" in s)
+    bearish_count = sum(1 for s in trend_signals if "bearish" in s)
+    
+    if bullish_count > bearish_count:
+        position = "LONG"
+        stop_pct = tr.get('stop_loss_long_pct', 0.03)
+        # Entry ideale: pull-back su SMA20 o sopra supporto
+        entry = current
+        if sma20 and current > sma20:
+            entry = round(sma20 * 1.005, 2)  # Leggermente sopra SMA20
+    elif bearish_count > bullish_count:
+        position = "SHORT"
+        stop_pct = tr.get('stop_loss_short_pct', 0.05)
+        entry = current
+        if sma20 and current < sma20:
+            entry = round(sma20 * 0.995, 2)
+    else:
+        position = "NEUTRAL"
+        stop_pct = tr.get('stop_loss_long_pct', 0.03)
+        entry = current
+    
+    # Calcolo ATR-based stop per precisione
+    if atr:
+        atr_stop = round(current - (atr * 2), 2) if position == "LONG" else round(current + (atr * 2), 2)
+        pct_stop = round(current * stop_pct, 2)
+        if position == "LONG":
+            stop_loss = max(atr_stop, current - pct_stop)
+        else:
+            stop_loss = min(atr_stop, current + pct_stop)
+    else:
+        stop_loss = round(current * (1 - stop_pct), 2) if position == "LONG" else round(current * (1 + stop_pct), 2)
+    
+    # Target multipli
+    risk = abs(entry - stop_loss)
+    t1_pct = tr.get('target_1_pct', 0.03)
+    t2_pct = tr.get('target_2_pct', 0.05)
+    t3_pct = tr.get('target_3_pct', 0.10)
+    
+    target_1 = round(entry * (1 + t1_pct), 2) if position == "LONG" else round(entry * (1 - t1_pct), 2)
+    target_2 = round(entry * (1 + t2_pct), 2) if position == "LONG" else round(entry * (1 - t2_pct), 2)
+    target_3 = round(entry * (1 + t3_pct), 2) if position == "LONG" else round(entry * (1 - t3_pct), 2)
+    
+    # Risk/Reward
+    risk_reward_1 = round(abs(target_1 - entry) / risk, 2) if risk > 0 else 0
+    risk_reward_2 = round(abs(target_2 - entry) / risk, 2) if risk > 0 else 0
+    risk_reward_3 = round(abs(target_3 - entry) / risk, 2) if risk > 0 else 0
+    
+    # CONFIDENCE SCORE (0-100) con motivazione dettagliata
+    confidence = 50  # Base
+    reasons = []
+    
+    # Trend alignment
+    if position == "LONG" and bullish_count >= 2:
+        confidence += 15
+        reasons.append(f"✅ Trend rialzista confermato ({bullish_count}/{len(trend_signals)} segnali)")
+    elif position == "SHORT" and bearish_count >= 2:
+        confidence += 15
+        reasons.append(f"✅ Trend ribassista confermato ({bearish_count}/{len(trend_signals)} segnali)")
+    else:
+        confidence -= 10
+        reasons.append("⚠️ Trend non chiaro o in conflitto")
+    
+    # RSI
+    if rsi is not None:
+        if position == "LONG" and 40 < rsi < 70:
+            confidence += 10
+            reasons.append(f"✅ RSI a {rsi} — momentum favorevole (non ipercomprato)")
+        elif position == "SHORT" and 30 < rsi < 60:
+            confidence += 10
+            reasons.append(f"✅ RSI a {rsi} — momentum favorevole (non ipervenduto)")
+        elif (position == "LONG" and rsi > 75) or (position == "SHORT" and rsi < 25):
+            confidence -= 15
+            reasons.append(f"⚠️ RSI estremo ({rsi}) — possibile inversione")
+    
+    # Bollinger
+    if bb:
+        if position == "LONG" and current < bb["lower"] * 1.02:
+            confidence += 10
+            reasons.append("✅ Prezzo vicino banda inferiore Bollinger — potenziale rimbalzo")
+        elif position == "SHORT" and current > bb["upper"] * 0.98:
+            confidence += 10
+            reasons.append("✅ Prezzo vicino banda superiore Bollinger — potenziale correzione")
+    
+    # Volume
+    if vol_trend == "CRESCENTE":
+        confidence += 10
+        reasons.append("✅ Volume in crescita — conferma interesse")
+    elif vol_trend == "DECRESCENTE":
+        confidence -= 5
+        reasons.append("⚠️ Volume in calo — debole conferma")
+    
+    # MACD
+    if macd and abs(macd["histogram"]) > 0.5:
+        confidence += 5
+        reasons.append("✅ MACD con momentum significativo")
+    
+    # Risk/Reward minimo
+    if risk_reward_1 >= 1.5:
+        confidence += 10
+        reasons.append(f"✅ R/R favorevole: {risk_reward_1}:1")
+    elif risk_reward_1 < 1.0:
+        confidence -= 10
+        reasons.append(f"⚠️ R/R sfavorevole: {risk_reward_1}:1")
+    
+    # Stochastic
+    if stoch:
+        if position == "LONG" and stoch["k"] < 30:
+            confidence += 5
+            reasons.append("✅ Stochastic in zona ipervenduto — potenziale rimbalzo")
+        elif position == "SHORT" and stoch["k"] > 70:
+            confidence += 5
+            reasons.append("✅ Stochastic in zona ipercomprato — potenziale correzione")
+    
+    # Limita confidence
+    confidence = max(0, min(100, confidence))
+    
+    # Determina durata posizione in base a confidence e volatilità
+    valid_days = tr.get('valid_days', 7)
+    if confidence >= 80:
+        hold_days = valid_days + 7  # Più sicuro = più lungo
+    elif confidence >= 60:
+        hold_days = valid_days
+    else:
+        hold_days = max(3, valid_days - 2)  # Meno sicuro = più breve
+    
+    valid_until = (datetime.now() + timedelta(days=hold_days)).strftime("%d/%m/%Y")
+    
+    # Determina sicurezza entrata
+    if confidence >= 80:
+        entry_safety = "🟢 ALTA — Entrata consigliata con sizing standard"
+    elif confidence >= 65:
+        entry_safety = "🟡 MEDIA-BUONA — Entrata possibile con sizing ridotto (50-70%)"
+    elif confidence >= 50:
+        entry_safety = "🟠 MEDIA — Attendere conferma o entrare con sizing minimo (25-30%)"
+    else:
+        entry_safety = "🔴 BASSA — Evitare entrata o usare solo paper trading"
+    
+    return {
+        "ticker": data["ticker"],
+        "company": company,
+        "position": position,
+        "entry": round(entry, 2),
+        "target_1": target_1,
+        "target_2": target_2,
+        "target_3": target_3,
+        "stop_loss": round(stop_loss, 2),
+        "risk_reward_1": risk_reward_1,
+        "risk_reward_2": risk_reward_2,
+        "risk_reward_3": risk_reward_3,
+        "confidence": confidence,
+        "confidence_reasons": reasons,
+        "entry_safety": entry_safety,
+        "valid_until": valid_until,
+        "hold_days": hold_days,
+        "indicators": {
+            "rsi": rsi,
+            "sma20": sma20,
+            "sma50": sma50,
+            "bb": bb,
+            "macd": macd,
+            "atr": atr,
+            "volume_trend": vol_trend,
+            "stochastic": stoch
+        }
+    }
+
