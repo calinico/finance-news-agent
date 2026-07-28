@@ -625,3 +625,294 @@ def main():
 
 if __name__ == "__main__":
     main()
+def analyze_sentiment(title, summary=""):
+    text = (title + " " + summary).lower()
+    positive = ["surge", "rally", "gain", "growth", "profit", "beat", "strong", "boom", "rise", "bull",
+                "breakthrough", "approval", "peace", "deal", "agreement", "treaty", "expansion", 
+                "outperform", "upgrade", "buy", "accumulate", "momentum", "record high", "all-time high",
+                "rialzo", "aumento", "utile", "crescita", "rialzista", "bullish", "taglio tassi", 
+                "rate cut", "lower rate", "stimolo", "stimulus", "recovery", "rebound", "bounce", "rimbalzo"]
+    negative = ["crash", "fall", "drop", "loss", "bear", "recession", "crisis", "decline", 
+                "sell-off", "bearish", "lawsuit", "recall", "war", "attack", "invasion", "sanctions",
+                "embargo", "bankruptcy", "default", "downgrade", "sell", "underperform", "miss",
+                "warning", "guidance cut", "profit warning", "caduta", "perdita", "crisi", "ribassista",
+                "ribasso", "rate hike", "rialzo tassi", "rate increase", "restructuring", "layoff", "layoffs"]
+    
+    if any(w in text for w in ["rate cut", "taglio tassi", "lower rate"]):
+        return "🟢 Positivo", "Taglio tassi: stimolo economico", "📈 Considerare accumulo tech e growth"
+    elif any(w in text for w in ["rate hike", "rialzo tassi", "rate increase"]):
+        return "🔴 Negativo", "Rialzo tassi: pressione su valutazioni", "📉 Considerare riduzione esposizione growth"
+    
+    pos = sum(1 for w in positive if w in text)
+    neg = sum(1 for w in negative if w in text)
+    
+    strong_pos = ["surge", "rally", "breakthrough", "record high", "all-time high", "boom"]
+    strong_neg = ["crash", "bankruptcy", "default", "recession", "crisis", "war"]
+    for w in strong_pos:
+        if w in text: pos += 1
+    for w in strong_neg:
+        if w in text: neg += 2
+    
+    if pos > neg + 1: return "🟢 Positivo", "Potenziale rialzo confermato", "📈 Considerare accumulo graduale"
+    elif neg > pos + 1: return "🔴 Negativo", "Potenziale ribasso confermato", "📉 Considerare hedging o riduzione"
+    elif pos > neg: return "🟢 Positivo (debole)", "Tendenza rialzista leggera", "📊 Monitorare per conferma"
+    elif neg > pos: return "🔴 Negativo (debole)", "Tendenza ribassista leggera", "⚠️ Attendere segnali di inversione"
+    return "🟡 Neutro", "Impatto incerto", "⏸️ Attendere sviluppi"
+def generate_projection(title, summary, sectors, sentiment, levels=None):
+    text = (title + " " + summary).lower()
+    projections = []
+    now = datetime.now()
+    short_term = (now + timedelta(days=3)).strftime("%d/%m")
+    mid_term = (now + timedelta(days=7)).strftime("%d/%m")
+    long_term = (now + timedelta(days=14)).strftime("%d/%m")
+    
+    if "Tech" in sectors or any(w in text for w in ["ai", "chip", "semiconductor", "cloud"]):
+        if "🟢" in sentiment: projections.append(f"🔮 Tech: momentum rialzista fino a {mid_term}. Se earnings confermano, estendere fino a {long_term}")
+        elif "🔴" in sentiment: projections.append(f"🔮 Tech: correzione possibile fino a {short_term}. Valutare ricompra su supporto SMA20")
+        else: projections.append(f"🔮 Tech: laterale {short_term}-{mid_term}. Catalyst: prossimi earnings o dati AI")
+    
+    if "Banche/Finanza" in sectors or any(w in text for w in ["fed", "ecb", "rate", "tassi"]):
+        if "taglio" in text or "cut" in text: projections.append(f"🔮 Banche: NIM compresso a breve (fino {short_term}). Stimolo credito positivo a medio termine ({mid_term})")
+        elif "rialzo" in text or "hike" in text: projections.append(f"🔮 Banche: NIM in espansione fino a {mid_term}. Attenzione rischio credito crescente post-{long_term}")
+        else: projections.append(f"🔮 Banche: stabilità se curve yield flat. Monitorare spread BTP-Bund")
+    
+    if "Energia" in sectors or any(w in text for w in ["oil", "petrolio", "gas"]):
+        if "🟢" in sentiment: projections.append(f"🔮 Energia: momentum se supply tight. Mantenere posizione fino a {mid_term}, rivedere su OPEC+")
+        elif "🔴" in sentiment: projections.append(f"🔮 Energia: correzione possibile fino a {short_term}. OPEC+ potrebbe intervenire entro {mid_term}")
+        else: projections.append(f"🔮 Energia: range-bound fino a {mid_term}. Dipende da geopolitica e demand estivo")
+    
+    if not projections:
+        if "🟢" in sentiment: projections.append(f"🔮 Proiezione generale: trend rialzista possibile fino a {mid_term} se momentum confermato da volumi")
+        elif "🔴" in sentiment: projections.append(f"🔮 Proiezione generale: cautela fino a {short_term}, possibile continuazione correzione fino a {mid_term}")
+        else: projections.append(f"🔮 Proiezione generale: laterale {short_term}-{mid_term}. Attendere breakout con volumi superiori alla media")
+    
+    if levels:
+        projections.append(f"⏳ HOLD SUGGERITO: mantenere posizione fino al {levels['valid_until']} o fino a target/stop raggiunto")
+    
+    return "\n".join(projections[:3])
+def analyze_geopolitical_impact(title, summary=""):
+    text = (title + " " + summary).lower()
+    high_tension = ["war", "attack", "invasion", "missile", "strike", "bombing", "sanctions", "embargo", "crisis", "nuclear"]
+    medium_tension = ["tension", "dispute", "warning", "threat", "concern", "risk", "standoff"]
+    deescalation = ["peace", "treaty", "agreement", "ceasefire", "diplomatic", "talks", "negotiation", "deal"]
+    
+    if any(w in text for w in deescalation): tension_level = "🟢 DE-ESCALATION"
+    elif any(w in text for w in high_tension): tension_level = "🔴 ALTA"
+    elif any(w in text for w in medium_tension): tension_level = "🟡 MEDIA"
+    else: tension_level = "🟢 BASSA"
+    
+    if any(w in text for w in ["oil", "petrolio", "gas", "energy", "opec"]): market_impact = "⛽ Energia: volatile — monitorare Brent e WTI"
+    elif any(w in text for w in ["gold", "oro", "safe haven", "treasury"]): market_impact = "🛡️ Safe Haven: possibile rialzo oro e bond lunghi"
+    elif any(w in text for w in ["fed", "ecb", "boe", "interest rate", "tasso"]): market_impact = "💰 Banche Centrali: impatto diretto su bond, azioni e forex"
+    elif any(w in text for w in ["trade", "tariff", "trade war"]): market_impact = "🌐 Commercio: settori export e tech esposti"
+    elif any(w in text for w in ["china", "taiwan", "semiconductor", "chip"]): market_impact = "🔌 Supply Chain: tech e chip a rischio"
+    else: market_impact = "📊 Mercati: monitorare reazione VIX e futures"
+    
+    if "🔴" in tension_level: projection = "📉 Proiezione: volatilità aumentata 24-48h, safe haven in rialzo, risk-off probabile"
+    elif "🟡" in tension_level: projection = "➡️ Proiezione: cautela, possibile range-bound fino a risoluzione"
+    elif "DE-ESCALATION" in tension_level: projection = "📈 Proiezione: se confermata, possibile risk-on e rimbalzo equity"
+    else: projection = "📊 Proiezione: impatto limitato, mercati potrebbero ignorare"
+    
+    return {"tension": tension_level, "market_impact": market_impact, "projection": projection, "valid_for": "24-72 ore"}
+def collect_news(sources, max_per_source=2):
+    all_news = []
+    for url in sources:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:max_per_source]:
+                title = entry.title
+                if is_news_sent(title):
+                    logger.info(f"News già inviata, saltata: {title[:50]}...")
+                    continue
+                all_news.append({
+                    "title": title,
+                    "link": entry.link,
+                    "source": url.split("/")[2] if "/" in url else "news",
+                    "summary": entry.get("summary", "")[:300],
+                    "published": entry.get("published", "N/A")
+                })
+        except Exception as e:
+            logger.error(f"Errore feed {url}: {e}")
+    return all_news
+def run_agent_cycle():
+    now = datetime.now()
+    logger.info(f"=== INIZIO CICLO AGENTE — {now.strftime('%d/%m/%Y %H:%M:%S')} ===")
+    try:
+        finance_news = collect_news(FINANCE_SOURCES, max_per_source=2)
+        geopol_news = collect_news(GEOPOL_SOURCES, max_per_source=2)
+        logger.info(f"News raccolte: Finanza={len(finance_news)}, Geopol={len(geopol_news)}")
+        
+        if not finance_news and not geopol_news:
+            logger.warning("Nessuna nuova notizia trovata")
+            log_execution("NO_NEWS", 0, 0, "Nessuna notizia nuova")
+            return
+
+        # MESSAGGIO 1: FINANZA
+        msg1 = f"🎯 <b>AGENTE OPPORTUNITÀ FINANZIARIE v2.0</b>\n"
+        msg1 += f"🕐 <b>{now.strftime('%d/%m/%Y %H:%M')}</b> | Ciclo: ogni {RUN_INTERVAL_HOURS}h\n"
+        msg1 += f"📊 Dati: 30 giorni | Indicatori: RSI, SMA, BB, MACD, ATR\n"
+        msg1 += "━" * 25 + "\n\n"
+        all_tickers = set()
+        
+        for i, news in enumerate(finance_news[:5], 1):
+            tickers, keywords, countries = find_tickers_from_news(news["title"], news["summary"])
+            all_tickers.update(tickers)
+            sectors = classify_sectors(news["title"], news["summary"])
+            sentiment, impact, rec = analyze_sentiment(news["title"], news["summary"])
+            projection = generate_projection(news["title"], news["summary"], sectors, sentiment)
+            
+            msg1 += f"<b>{i}. {news['title']}</b>\n"
+            msg1 += f"📰 {news['source']} | 🕐 {news.get('published', 'N/A')}\n"
+            msg1 += f"🔗 {news['link']}\n"
+            if keywords: msg1 += f"🔑 Keyword: {', '.join(keywords[:3])}\n"
+            if countries: msg1 += f"🌍 Paesi: {', '.join([c[0] for c in countries[:3]])}\n"
+            msg1 += f"🏷️ Settori: {', '.join(sectors)}\n"
+            msg1 += f"{sentiment} | {impact}\n"
+            msg1 += f"💡 {rec}\n"
+            msg1 += f"{projection}\n"
+            if tickers:
+                ticker_names = [f"{t} ({get_company_name(t).split(' —')[0]})" for t in tickers[:4]]
+                msg1 += f"📊 Azioni: {', '.join(ticker_names)}\n"
+            msg1 += "\n"
+            mark_news_sent(news["title"], tickers)
+        
+        msg1 += "━" * 25 + "\n"
+        send_telegram_message(msg1)
+        time.sleep(1)
+
+        # MESSAGGIO 2: GEOPOLITICA
+        if geopol_news:
+            msg2 = f"🌍 <b>GEOPOLITICA & BANCHE CENTRALI</b>\n"
+            msg2 += f"🕐 <b>{now.strftime('%d/%m/%Y %H:%M')}</b>\n"
+            msg2 += "━" * 25 + "\n\n"
+            for i, news in enumerate(geopol_news[:5], 1):
+                geo = analyze_geopolitical_impact(news["title"], news["summary"])
+                tickers, keywords, countries = find_tickers_from_news(news["title"], news["summary"])
+                all_tickers.update(tickers)
+                msg2 += f"<b>{i}. {news['title']}</b>\n"
+                msg2 += f"📰 {news['source']} | 🕐 {news.get('published', 'N/A')}\n"
+                msg2 += f"🔗 {news['link']}\n"
+                msg2 += f"{geo['tension']}\n"
+                msg2 += f"{geo['market_impact']}\n"
+                msg2 += f"{geo['projection']}\n"
+                msg2 += f"⏳ Validità: {geo['valid_for']}\n"
+                if countries: msg2 += f"🌍 Paesi: {', '.join([c[0] for c in countries[:3]])}\n"
+                if tickers:
+                    ticker_names = [f"{t} ({get_company_name(t).split(' —')[0]})" for t in tickers[:4]]
+                    msg2 += f"📊 Asset: {', '.join(ticker_names)}\n"
+                msg2 += "\n"
+                mark_news_sent(news["title"], tickers)
+            msg2 += "━" * 25 + "\n"
+            send_telegram_message(msg2)
+            time.sleep(1)
+
+        # MESSAGGIO 3: GRAFICI
+        if all_tickers:
+            msg3 = "📈 <b>GRAFICI AVANZATI — ANALISI TECNICA COMPLETA</b>\n"
+            msg3 += "━" * 25 + "\n"
+            msg3 += "⚠️ <i>Disclaimer: Analisi educativa. Non consiglio finanziario.</i>\n"
+            msg3 += f"📊 Dati storici: 30 giorni | Indicatori: RSI, SMA20, Bollinger, MACD, ATR\n"
+            msg3 += f"🕐 Generato: {now.strftime('%d/%m/%Y %H:%M')}\n\n"
+            send_telegram_message(msg3)
+            time.sleep(1)
+            
+            charts_sent = 0
+            for ticker in all_tickers:
+                data = get_stock_data(ticker, days=30)
+                if data:
+                    levels = calculate_trading_levels(data)
+                    chart_buf = generate_advanced_chart(data, levels)
+                    if chart_buf:
+                        change = data["change"]
+                        company = data.get("company", ticker)
+                        caption = f"<b>{ticker}</b> — {company}\n"
+                        caption += f"{'+' if change >= 0 else ''}{change:.2f}% | ${data['current']:.2f}\n"
+                        caption += f"🕐 Dati fino al: {data['dates'][-1]} | Generato: {now.strftime('%d/%m/%Y %H:%M')}\n\n"
+                        
+                        if levels:
+                            caption += f"<b>📊 LIVELLI TRADING</b>\n"
+                            caption += f"🎯 Entrata: <code>${levels['entry']:.2f}</code>\n"
+                            caption += f"🎯 Target 1: <code>${levels['target_1']:.2f}</code> (+{((levels['target_1']/levels['entry'])-1)*100:.1f}%)\n"
+                            caption += f"🎯 Target 2: <code>${levels['target_2']:.2f}</code> (+{((levels['target_2']/levels['entry'])-1)*100:.1f}%)\n"
+                            caption += f"🎯 Target 3: <code>${levels['target_3']:.2f}</code> (+{((levels['target_3']/levels['entry'])-1)*100:.1f}%)\n"
+                            caption += f"🛑 Stop-Loss: <code>${levels['stop_loss']:.2f}</code> ({((levels['stop_loss']/levels['entry'])-1)*100:.1f}%)\n"
+                            caption += f"⚖️ Risk/Reward: <code>{levels['risk_reward']}</code>\n"
+                            caption += f"📈 Posizione: <code>{levels['suggested_position']}</code>\n"
+                            caption += f"🎯 Fiducia: <code>{levels['confidence']} ({levels['confidence_score']}%)</code>\n"
+                            caption += f"⏳ Valida fino al: <code>{levels['valid_until']}</code>\n"
+                            caption += f"📅 Timeframe: <code>{levels['timeframe']}</code>\n\n"
+                            
+                            caption += f"<b>📐 INDICATORI TECNICI</b>\n"
+                            if levels.get('rsi'): caption += f"📊 RSI(14): <code>{levels['rsi']}</code>\n"
+                            if levels.get('sma20'): caption += f"📊 SMA20: <code>${levels['sma20']:.2f}</code>\n"
+                            if levels.get('atr'): caption += f"📊 ATR(14): <code>${levels['atr']:.2f}</code>\n"
+                            if levels.get('volume_trend'): caption += f"📊 Volume: <code>{levels['volume_trend']}</code>\n"
+                            if levels.get('signals'): caption += f"📊 Segnali: <code>{'; '.join(levels['signals'][:3])}</code>\n"
+                            
+                            caption += f"\n💡 <b>Scenario:</b> Se entri a ${levels['entry']:.2f}:\n"
+                            caption += f"Profitto potenziale: +{((levels['target_1']/levels['entry'])-1)*100:.1f}% → +{((levels['target_2']/levels['entry'])-1)*100:.1f}%\n"
+                            caption += f"Perdita max: {((levels['stop_loss']/levels['entry'])-1)*100:.1f}%\n"
+                            caption += f"🎯 Sicurezza entrata: <b>{levels['confidence_score']}%</b> — {levels['confidence']}"
+                            
+                            save_prediction(ticker, company, "SWING", levels['entry'], 
+                                          levels['target_1'], levels['target_2'], levels['target_3'],
+                                          levels['stop_loss'], levels['confidence_score'], 
+                                          levels['suggested_position'], levels['valid_until_dt'])
+                        
+                        send_photo_to_telegram(chart_buf, caption)
+                        charts_sent += 1
+                        time.sleep(1.5)
+            
+            logger.info(f"Ciclo completato. Grafici inviati: {charts_sent}")
+            log_execution("SUCCESS", len(finance_news) + len(geopol_news), charts_sent)
+        else:
+            log_execution("SUCCESS_NO_CHARTS", len(finance_news) + len(geopol_news), 0)
+            
+    except Exception as e:
+        logger.exception("Errore nel ciclo agente")
+        log_execution("ERROR", 0, 0, str(e))
+        try:
+            send_telegram_message(f"⚠️ <b>ERRORE AGENTE</b>\n{now.strftime('%d/%m/%Y %H:%M')}\n{e}\n\nL'agente riproverà al prossimo ciclo.")
+        except:
+            pass
+
+# SCHEDULER ROBUSTO
+_running = True
+
+def signal_handler(signum, frame):
+    global _running
+    logger.info("Segnale di arresto ricevuto. Arresto graceful...")
+    _running = False
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+def scheduler_loop():
+    global _running
+    logger.info(f"Scheduler avviato. Intervallo: {RUN_INTERVAL_HOURS} ore")
+    run_agent_cycle()
+    while _running:
+        next_run = datetime.now() + timedelta(hours=RUN_INTERVAL_HOURS)
+        logger.info(f"Prossima esecuzione: {next_run.strftime('%d/%m/%Y %H:%M:%S')}")
+        while datetime.now() < next_run and _running:
+            time.sleep(30)
+        if _running:
+            run_agent_cycle()
+
+def main():
+    init_db()
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("TELEGRAM_TOKEN o TELEGRAM_CHAT_ID mancanti!")
+        print("Errore: imposta le variabili d'ambiente TELEGRAM_TOKEN e TELEGRAM_CHAT_ID")
+        return
+    logger.info("=" * 60)
+    logger.info("FINANCE NEWS AGENT v2.0 — Avvio")
+    logger.info("=" * 60)
+    last = get_last_execution()
+    if last:
+        logger.info(f"Ultima esecuzione: {last[0]} | Status: {last[1]} | News: {last[2]} | Charts: {last[3]}")
+    scheduler_loop()
+    logger.info("Agente arrestato. Arrivederci!")
+
+if __name__ == "__main__":
+    main()
