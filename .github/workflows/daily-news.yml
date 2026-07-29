@@ -24,6 +24,12 @@ jobs:
         run: |
           pip install feedparser requests matplotlib
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
       - name: Run advanced trading agent
         run: python agent.py
         env:
