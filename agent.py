@@ -1418,5 +1418,331 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
+    # ============================================
+# TELEGRAM (con retry)
+# ============================================
+def send_telegram_message(text: str, chat_id: str = None, max_retries: int = 3) -> bool:
+    chat_id = chat_id or CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
+        logger.warning("Telegram non configurato")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            if resp.status_code == 200:
+                return True
+            logger.warning(f"Telegram HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Telegram errore (tentativo {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    return False
+
+def send_telegram_photo(photo_path: str, caption: str = "", chat_id: str = None) -> bool:
+    chat_id = chat_id or CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    for attempt in range(3):
+        try:
+            with open(photo_path, 'rb') as f:
+                files = {'photo': f}
+                data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
+                resp = requests.post(url, files=files, data=data, timeout=30)
+                if resp.status_code == 200:
+                    return True
+                logger.warning(f"Telegram photo HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Telegram photo errore: {e}")
+            time.sleep(2 ** attempt)
+    return False
+
+# ============================================
+# FETCH NEWS (con filtri e deduplicazione)
+# ============================================
+def fetch_news_feed(url: str, max_items: int = 3) -> List[Dict]:
+    try:
+        resp = fetch_with_retry(url, timeout=15)
+        feed = feedparser.parse(resp.content)
+        news = []
+        for entry in feed.entries[:max_items]:
+            title = entry.get('title', '').strip()
+            summary = entry.get('summary', '')[:300]
+            published = entry.get('published', '')
+            link = entry.get('link', '')
+            if title and not db.is_news_sent(title):
+                news.append({
+                    'title': title,
+                    'summary': summary,
+                    'published': published,
+                    'link': link,
+                    'source': url
+                })
+        return news
+    except Exception as e:
+        logger.error(f"Errore fetch feed {url}: {e}")
+        return []
+
+def process_news_item(item: Dict) -> Optional[Dict]:
+    title = item['title']
+    summary = item.get('summary', '')
+
+    tickers, keywords, countries = find_tickers_from_news(title, summary)
+    if not tickers:
+        return None
+
+    sectors = classify_sectors(title, summary)
+
+    return {
+        'title': title,
+        'summary': summary,
+        'published': item.get('published', ''),
+        'link': item.get('link', ''),
+        'tickers': tickers[:CFG.get('limits', {}).get('max_tickers_per_news', 4)],
+        'keywords': keywords,
+        'countries': [c[0] for c in countries],
+        'sectors': sectors
+    }
+
+# ============================================
+# FORMATTAZIONE MESSAGGIO AVANZATA
+# ============================================
+def format_prediction_message(pred: Dict, news_title: str = "") -> str:
+    company = pred.get("company", pred["ticker"])
+    lines = [
+        f"**SIGNAL: {pred['ticker']} - {company}**",
+        "",
+        f"**Notizia trigger:** {news_title}" if news_title else "",
+        "",
+        f"**Setup:** {pred['position']}",
+        f"**Entry:** ${pred['entry']}",
+        f"**Stop Loss:** ${pred['stop_loss']}",
+        f"**Target 1:** ${pred['target_1']} (R/R: {pred['risk_reward_1']}:1)",
+        f"**Target 2:** ${pred['target_2']} (R/R: {pred['risk_reward_2']}:1)",
+        f"**Target 3:** ${pred['target_3']} (R/R: {pred['risk_reward_3']}:1)",
+        "",
+        f"**Sicurezza Entrata:** {pred['entry_safety']}",
+        f"**Confidence Score:** {pred['confidence']}/100",
+        "",
+        f"**Data analisi:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        f"**Valido fino al:** {pred['valid_until']}",
+        f"**Durata posizione:** {pred['hold_days']} giorni",
+        "",
+        "**Motivazione Confidence:**"
+    ]
+
+    for reason in pred.get('confidence_reasons', []):
+        lines.append(f" {reason}")
+
+    lines.append("")
+    lines.append("**Indicatori:**")
+    ind = pred.get('indicators', {})
+    if ind.get('rsi'):
+        lines.append(f" - RSI(14): {ind['rsi']}")
+    if ind.get('sma20'):
+        lines.append(f" - SMA20: ${ind['sma20']}")
+    if ind.get('sma50'):
+        lines.append(f" - SMA50: ${ind['sma50']}")
+    if ind.get('macd'):
+        lines.append(f" - MACD: {ind['macd']['trend']} (hist: {ind['macd']['histogram']})")
+    if ind.get('atr'):
+        lines.append(f" - ATR(14): ${ind['atr']}")
+    if ind.get('stochastic'):
+        lines.append(f" - Stoch(14,3): K={ind['stochastic']['k']} D={ind['stochastic']['d']} [{ind['stochastic']['signal']}]")
+    if ind.get('volume_trend'):
+        lines.append(f" - Volume: {ind['volume_trend']}")
+
+    return "\n".join([l for l in lines if l])
+
+# ============================================
+# HEARTBEAT
+# ============================================
+def send_heartbeat():
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        uptime_hours = (time.time() - START_TIME) / 3600
+    except:
+        mem_mb = 0
+        uptime_hours = (time.time() - START_TIME) / 3600
+
+    db.log_heartbeat("OK", mem_mb, uptime_hours)
+    watchdog.heartbeat()
+
+# ============================================
+# MAIN LOOP
+# ============================================
+START_TIME = time.time()
+
+def run_cycle():
+    start_ts = time.time()
+    logger.info("=" * 50)
+    logger.info("INIZIO CICLO ANALISI")
+    logger.info("=" * 50)
+
+    news_count = 0
+    charts_count = 0
+    error_msg = ""
+
+    try:
+        # Cleanup DB vecchio
+        db.cleanup_old_news(30)
+
+        # Fetch finance news
+        finance_sources = CFG.get('sources', {}).get('finance', [])
+        geopol_sources = CFG.get('sources', {}).get('geopol', [])
+        limits = CFG.get('limits', {})
+
+        all_news = []
+        for url in finance_sources[:limits.get('max_finance_news', 5)]:
+            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
+            all_news.extend(news)
+
+        for url in geopol_sources[:limits.get('max_geopol_news', 5)]:
+            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
+            all_news.extend(news)
+
+        logger.info(f"Notizie fresche trovate: {len(all_news)}")
+
+        processed = []
+        for item in all_news:
+            result = process_news_item(item)
+            if result:
+                processed.append(result)
+                db.mark_news_sent(item['title'], result['tickers'])
+
+        # Analisi e invio
+        for news in processed:
+            for ticker in news['tickers']:
+                data = get_stock_data(ticker)
+                if not data:
+                    continue
+
+                levels = calculate_trading_levels(data)
+                if not levels:
+                    continue
+
+                # Salva prediction
+                db.save_prediction(
+                    ticker=ticker,
+                    company_name=levels['company'],
+                    strategy=levels['position'],
+                    entry=levels['entry'],
+                    target_1=levels['target_1'],
+                    target_2=levels['target_2'],
+                    target_3=levels['target_3'],
+                    stop_loss=levels['stop_loss'],
+                    confidence=levels['confidence'],
+                    confidence_reason=" | ".join(levels['confidence_reasons']),
+                    position=levels['position'],
+                    valid_until=levels['valid_until'],
+                    hold_days=levels['hold_days']
+                )
+
+                # Genera e invia grafico
+                chart_path = create_advanced_chart(data, levels)
+                msg = format_prediction_message(levels, news['title'])
+
+                send_telegram_message(msg)
+                send_telegram_photo(chart_path, caption=f"{ticker} - {levels['company']}")
+
+                charts_count += 1
+                news_count += 1
+
+                # Rimuovi file grafico
+                try:
+                    os.remove(chart_path)
+                except:
+                    pass
+
+        duration = time.time() - start_ts
+        db.log_execution("SUCCESS", news_count, charts_count, "", duration)
+        logger.info(f"Ciclo completato: {news_count} notizie, {charts_count} chart in {duration:.1f}s")
+
+    except Exception as e:
+        error_msg = str(e)
+        duration = time.time() - start_ts
+        db.log_execution("ERROR", news_count, charts_count, error_msg, duration)
+        logger.exception(f"Errore ciclo: {e}")
+        send_telegram_message(f"**ERRORE CICLO**\n\n`{error_msg[:500]}`")
+
+    return news_count, charts_count
+
+def main():
+    logger.info("=" * 50)
+    logger.info("FINANCE NEWS AGENT v5.0 AVVIATO")
+    logger.info("=" * 50)
+
+    # Avvia watchdog
+    watchdog.start()
+
+    # Invia messaggio di avvio
+    send_telegram_message(
+        f"**Finance News Agent v5.0 Avviato**\n\n"
+        f"**Data:** {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+        f"**Intervallo:** {RUN_INTERVAL_HOURS}h\n"
+        f"**DB:** {DB_PATH}"
+    )
+
+    cycle_count = 0
+    hb_cfg = CFG.get('heartbeat', {})
+    hb_interval = hb_cfg.get('interval_runs', 6)
+
+    while True:
+        global WATCHDOG_TRIGGERED
+        if WATCHDOG_TRIGGERED:
+            logger.warning("Watchdog triggered! Riavvio ciclo...")
+            WATCHDOG_TRIGGERED = False
+
+        try:
+            run_cycle()
+            cycle_count += 1
+
+            # Heartbeat DB + Watchdog
+            send_heartbeat()
+
+            # Heartbeat Telegram periodico
+            if cycle_count % hb_interval == 0 and hb_cfg.get('enabled', True):
+                uptime = (time.time() - START_TIME) / 3600
+                send_telegram_message(
+                    f"**Heartbeat**\n\n"
+                    f"Cicli completati: {cycle_count}\n"
+                    f"Uptime: {uptime:.1f}h\n"
+                    f"Prossimo ciclo: {RUN_INTERVAL_HOURS}h"
+                )
+
+        except Exception as e:
+            logger.exception(f"Errore grave nel main loop: {e}")
+            send_telegram_message(f"**ERRORE GRAVE**\n\n`{str(e)[:500]}`")
+
+        # Sleep con check interrupt
+        sleep_seconds = RUN_INTERVAL_HOURS * 3600
+        logger.info(f"Sleep per {RUN_INTERVAL_HOURS}h...")
+
+        for _ in range(sleep_seconds):
+            if WATCHDOG_TRIGGERED:
+                break
+            time.sleep(1)
+
+if __name__ == "__main__":
+    # Gestione segnali
+    def signal_handler(signum, frame):
+        logger.info("Segnale di arresto ricevuto")
+        watchdog.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     main()
 
