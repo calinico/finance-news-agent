@@ -1,5 +1,5 @@
 # ============================================
-# FINANCE NEWS AGENT — CONFIGURAZIONE v4.0
+# FINANCE NEWS AGENT - CONFIGURAZIONE v5.0
 # ============================================
 
 # Intervallo tra cicli (ore)
@@ -21,7 +21,7 @@ logging:
   max_bytes: 1048576
   backup_count: 5
 
-# Analisi Tecnica — periodi indicatori
+# Analisi Tecnica - periodi indicatori
 technical:
   history_days: 30
   rsi_period: 14
@@ -49,7 +49,7 @@ retry:
   base_delay: 2
   max_delay: 30
 
-# Watchdog — rileva blocchi
+# Watchdog - rileva blocchi
 watchdog:
   enabled: true
   timeout_seconds: 1800      # 30 minuti senza heartbeat = blocco
