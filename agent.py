@@ -1,44 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================
-# FINANCE NEWS AGENT v3.0 — COMPLETO & STABILE
+# FINANCE NEWS AGENT v5.0 — COMPLETO & STABILE
 # ============================================
 # Fix: deduplicazione, logging, indicatori tecnici reali,
 #      date specifiche, nomi aziende, confidence score,
-#      gestione errori, heartbeat, retry
+#      gestione errori, heartbeat, retry, watchdog
 
 import feedparser
 import requests
 import os
-import json
 import re
-import io
+import html as html_lib
 import sqlite3
 import signal
 import sys
 import logging
 import hashlib
 import yaml
+import threading
+import time
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Set
-import time
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # ============================================
 # CONFIGURAZIONE
 # ============================================
 CONFIG_PATH = Path("config.yaml")
 
+DEFAULT_FINANCE_SOURCES = [
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+]
+
+DEFAULT_GEOPOL_SOURCES = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+]
+
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
+            cfg = yaml.safe_load(f) or {}
     else:
         cfg = {}
     cfg.setdefault('telegram', {})
@@ -49,19 +69,36 @@ def load_config() -> dict:
     cfg.setdefault('technical', {})
     cfg.setdefault('trading', {})
     cfg.setdefault('limits', {})
+    cfg['limits'].setdefault('max_news_per_cycle', 10)
+    cfg['limits'].setdefault('max_tickers_per_news', 3)
+    cfg['limits'].setdefault('max_charts_per_cycle', 8)
     cfg.setdefault('sources', {}).setdefault('finance', [])
     cfg.setdefault('sources', {}).setdefault('geopol', [])
+    if not cfg['sources']['finance']:
+        cfg['sources']['finance'] = DEFAULT_FINANCE_SOURCES
+    if not cfg['sources']['geopol']:
+        cfg['sources']['geopol'] = DEFAULT_GEOPOL_SOURCES
+    cfg.setdefault('heartbeat', {}).setdefault('enabled', True)
+    cfg.setdefault('heartbeat', {}).setdefault('interval_runs', 6)
+    cfg.setdefault('charts', {}).setdefault('dir', 'charts')
+    cfg.setdefault('charts', {}).setdefault('enabled', True)
+    cfg.setdefault('logging', {})
     return cfg
+
 
 CFG = load_config()
 TELEGRAM_TOKEN = CFG['telegram']['token']
 CHAT_ID = CFG['telegram']['chat_id']
 DB_PATH = CFG['database']['path']
 RUN_INTERVAL_HOURS = CFG['run_interval_hours']
+CHARTS_DIR = Path(CFG['charts']['dir'])
+CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================
 # LOGGING
 # ============================================
+
+
 def setup_logging() -> logging.Logger:
     log_cfg = CFG.get('logging', {})
     level = getattr(logging, log_cfg.get('level', 'INFO').upper(), logging.INFO)
@@ -82,11 +119,61 @@ def setup_logging() -> logging.Logger:
         logger.addHandler(ch)
     return logger
 
+
 logger = setup_logging()
+
+# ============================================
+# WATCHDOG
+# ============================================
+
+
+class Watchdog:
+    def __init__(self, timeout_sec: int = 300):
+        self.timeout = timeout_sec
+        self._timer = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def start(self):
+        with self._lock:
+            self._running = True
+            self._reset_timer()
+        logger.info("Watchdog avviato")
+
+    def stop(self):
+        with self._lock:
+            self._running = False
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+        logger.info("Watchdog fermato")
+
+    def heartbeat(self):
+        with self._lock:
+            if self._running:
+                self._reset_timer()
+
+    def _reset_timer(self):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.timeout, self._on_timeout)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_timeout(self):
+        global WATCHDOG_TRIGGERED
+        WATCHDOG_TRIGGERED = True
+        logger.warning("WATCHDOG TRIGGERED - ciclo bloccato!")
+
+
+watchdog = Watchdog(timeout_sec=600)
+WATCHDOG_TRIGGERED = False
 
 # ============================================
 # DATABASE
 # ============================================
+
+
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -137,6 +224,15 @@ class Database:
                     hit_stop INTEGER DEFAULT 0
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS heartbeat_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT,
+                    memory_mb REAL,
+                    uptime_hours REAL
+                )
+            """)
             conn.commit()
             logger.info("Database inizializzato")
 
@@ -169,8 +265,8 @@ class Database:
             conn.commit()
 
     def save_prediction(self, ticker: str, company_name: str, strategy: str, entry: float,
-                       target_1: float, target_2: float, target_3: float, stop_loss: float,
-                       confidence: int, position: str, valid_until: str):
+                        target_1: float, target_2: float, target_3: float, stop_loss: float,
+                        confidence: int, position: str, valid_until: str):
         with self._connect() as conn:
             c = conn.cursor()
             c.execute("""
@@ -178,6 +274,23 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (ticker, company_name, strategy, entry, target_1, target_2, target_3, stop_loss, confidence, position, valid_until))
             conn.commit()
+
+    def cleanup_old_news(self, days: int = 30):
+        with self._connect() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM sent_news WHERE sent_at < datetime('now', '-{} days')".format(days))
+            deleted = c.rowcount
+            conn.commit()
+            if deleted > 0:
+                logger.info(f"Pulizia DB: {deleted} notizie vecchie eliminate")
+
+    def log_heartbeat(self, status: str, memory_mb: float, uptime_hours: float):
+        with self._connect() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO heartbeat_log (status, memory_mb, uptime_hours) VALUES (?, ?, ?)",
+                      (status, memory_mb, uptime_hours))
+            conn.commit()
+
 
 db = Database(DB_PATH)
 
@@ -237,15 +350,15 @@ COMPANY_NAMES = {
     "HII": "Huntington Ingalls Industries", "KTOS": "Kratos Defense & Security Solutions",
     "BWXT": "BWX Technologies Inc.", "CRWD": "CrowdStrike Holdings Inc.",
     "PANW": "Palo Alto Networks Inc.", "FTNT": "Fortinet Inc.", "ZS": "Zscaler Inc.",
-    "OKTA": "Okta Inc.", "S": "SentinelOne Inc.", "NET": "Cloudflare Inc.",
+    "OKTA": "Okta Inc.", "NET": "Cloudflare Inc.",
     "DDOG": "Datadog Inc.", "MDB": "MongoDB Inc.", "VEEV": "Veeva Systems Inc.",
     "DOCU": "DocuSign Inc.", "SHOP": "Shopify Inc.", "ETSY": "Etsy Inc.",
     "EBAY": "eBay Inc.", "W": "Wayfair Inc.", "RIVN": "Rivian Automotive Inc.",
     "LCID": "Lucid Group Inc.", "NIO": "NIO Inc.", "XPEV": "XPeng Inc.",
     "LI": "Li Auto Inc.", "QS": "QuantumScape Corp.", "MP": "MP Materials Corp.",
-    "ALB": "Albemarle Corp.", "SQM": "Sociedad Química y Minera", "LTHM": "Livent Corp.",
+    "ALB": "Albemarle Corp.", "SQM": "Sociedad Quimica y Minera", "LTHM": "Livent Corp.",
     "ENI": "Eni S.p.A.", "UCG": "UniCredit S.p.A.", "ISP": "Intesa Sanpaolo S.p.A.",
-    "LUX": "Luxottica Group", "TOT": "TotalEnergies SE", "OR": "L'Oréal S.A.",
+    "LUX": "Luxottica Group", "TOT": "TotalEnergies SE", "OR": "L'Oreal S.A.",
     "SAN": "Sanofi S.A.", "AIR": "Airbus SE", "SAP": "SAP SE", "SIE": "Siemens AG",
     "BMWYY": "Bayerische Motoren Werke AG", "VWAGY": "Volkswagen AG",
     "MBGYY": "Mercedes-Benz Group AG", "TM": "Toyota Motor Corp.",
@@ -259,22 +372,22 @@ COMPANY_NAMES = {
     "LPL": "LG Display Co.", "WPL": "Woodside Energy Group", "NAB": "National Australia Bank",
     "WBC": "Westpac Banking Corp.", "ANZ": "ANZ Group Holdings", "TEVA": "Teva Pharmaceutical",
     "ICL": "ICL Group Ltd.", "CHKP": "Check Point Software Technologies",
-    "CYBR": "CyberArk Software Ltd.", "PBR": "Petróleo Brasileiro S.A.",
-    "ITUB": "Itaú Unibanco Holding", "BBD": "Banco Bradesco S.A.",
-    "FMX": "Fomento Económico Mexicano", "AMX": "América Móvil S.A.B.",
-    "CEMEX": "Cemex S.A.B. de C.V.", "GMEXIC": "Grupo México S.A.B.",
-    "GGAL": "Grupo Financiero Galicia", "YPF": "YPF S.A.", "PAM": "Pampa Energía S.A.",
+    "CYBR": "CyberArk Software Ltd.", "PBR": "Petroleo Brasileiro S.A.",
+    "ITUB": "Itau Unibanco Holding", "BBD": "Banco Bradesco S.A.",
+    "FMX": "Fomento Economico Mexicano", "AMX": "America Movil S.A.B.",
+    "CEMEX": "Cemex S.A.B. de C.V.", "GMEXIC": "Grupo Mexico S.A.B.",
+    "GGAL": "Grupo Financiero Galicia", "YPF": "YPF S.A.", "PAM": "Pampa Energia S.A.",
     "TEO": "Telecom Argentina S.A.", "NEM": "Newmont Corp.", "AEM": "Agnico Eagle Mines",
     "KGC": "Kinross Gold Corp.", "WPM": "Wheaton Precious Metals Corp.",
     "RGLD": "Royal Gold Inc.", "FNV": "Franco-Nevada Corp.", "PAAS": "Pan American Silver Corp.",
     "HL": "Hecla Mining Co.", "CDE": "Coeur Mining Inc.", "EXK": "Endeavour Silver Corp.",
     "MAG": "MAG Silver Corp.", "SCCO": "Southern Copper Corp.", "TECK": "Teck Resources Ltd.",
     "GLNCY": "Glencore plc", "ANTO": "Antofagasta plc", "CLF": "Cleveland-Cliffs Inc.",
-    "TX": "Ternium S.A.", "DJP": "iPath Bloomberg Commodity Index", "DBC": "Invesco DB Commodity Tracking",
+    "TX": "Ternium S.A.", "DBC": "Invesco DB Commodity Tracking",
     "GSG": "iShares S&P GSCI Commodity-Indexed Trust", "COMT": "iShares GSCI Commodity Dynamic Roll Strategy",
     "USCI": "United States Commodity Index Fund", "GCC": "WisdomTree Continuous Commodity Index",
-    "ITA": "iShares U.S. Aerospace & Defense ETF", "VORB": "Virgin Orbit Holdings Inc.",
-    "MNTS": "Momentus Inc.", "LUNR": "Intuitive Machines Inc.", "HOOD": "Robinhood Markets Inc.",
+    "ITA": "iShares U.S. Aerospace & Defense ETF",
+    "LUNR": "Intuitive Machines Inc.", "HOOD": "Robinhood Markets Inc.",
     "ETHE": "Grayscale Ethereum Trust", "HIVE": "HIVE Blockchain Technologies Ltd.",
     "HUT": "Hut 8 Mining Corp.", "BITF": "Bitfarms Ltd.", "SQ": "Block Inc.",
     "PYPL": "PayPal Holdings Inc.", "IBM": "International Business Machines",
@@ -318,115 +431,18 @@ COMPANY_NAMES = {
     "BLK": "BlackRock Inc.", "AXP": "American Express Co.", "SCHW": "Charles Schwab Corp.",
     "BK": "Bank of New York Mellon", "STT": "State Street Corp.", "ICE": "Intercontinental Exchange",
     "CME": "CME Group Inc.", "NDAQ": "Nasdaq Inc.", "MCO": "Moody's Corp.",
-    "SPGI": "S&P Global Inc.", "AON": "Aon plc", "AJG": "Arthur J. Gallagher & Co.",
-    "MMC": "Marsh & McLennan Companies", "MET": "MetLife Inc.", "PRU": "Prudential Financial Inc.",
-    "AFL": "Aflac Inc.", "PFG": "Principal Financial Group", "LNC": "Lincoln National Corp.",
-    "RJF": "Raymond James Financial", "L": "Loews Corp.", "ALL": "Allstate Corp.",
-    "TRV": "Travelers Companies Inc.", "CB": "Chubb Ltd.", "PGR": "Progressive Corp.",
-    "CINF": "Cincinnati Financial Corp.", "WRB": "W.R. Berkley Corp.", "AFG": "American Financial Group",
-    "Y": "Alleghany Corp.", "RE": "Everest Re Group Ltd.", "RNR": "RenaissanceRe Holdings",
-    "AXS": "Axis Capital Holdings", "ACGL": "Arch Capital Group Ltd.", "MKL": "Markel Corp.",
-    "BRK-B": "Berkshire Hathaway Inc.", "BRK-A": "Berkshire Hathaway Inc.",
-    "ORI": "Old Republic International", "FAF": "First American Financial",
-    "FNF": "Fidelity National Financial", "RDN": "Radian Group Inc.", "MTG": "MGIC Investment Corp.",
-    "ESNT": "Essent Group Ltd.", "NMIH": "NMI Holdings Inc.",
-    "OPEN": "Opendoor Technologies Inc.", "Z": "Zillow Group Inc.", "ZG": "Zillow Group Inc.",
-    "EXPI": "eXp World Holdings Inc.", "COMP": "Compass Inc.", "RDFN": "Redfin Corp.",
-    "LESL": "Leslie's Inc.", "POOL": "Pool Corp.", "SITE": "SiteOne Landscape Supply",
-    "TSCO": "Tractor Supply Co.", "FND": "Floor & Decor Holdings", "LL": "LL Flooring Holdings",
-    "SHW": "Sherwin-Williams Co.", "PPG": "PPG Industries Inc.", "AXTA": "Axalta Coating Systems",
-    "RPM": "RPM International Inc.", "MAS": "Masco Corp.", "FBHS": "Fortune Brands Home & Security",
-    "JELD": "JELD-WEN Holding Inc.", "DOOR": "Masonite International Corp.",
-    "APOG": "Apogee Enterprises Inc.", "PGTI": "PGT Innovations Inc.",
-    "OC": "Owens Corning", "LPX": "Louisiana-Pacific Corp.", "WY": "Weyerhaeuser Co.",
-    "RFP": "Resolute Forest Products", "UFS": "Domtar Corp.", "PKG": "Packaging Corp. of America",
-    "IP": "International Paper Co.", "WRK": "WestRock Co.", "SON": "Sonoco Products Co.",
-    "GEF": "Greif Inc.", "SLGN": "Silgan Holdings Inc.", "BERY": "Berry Global Group Inc.",
-    "AMCR": "Amcor plc", "BALL": "Ball Corp.", "CCK": "Crown Holdings Inc.",
-    "OI": "O-I Glass Inc.", "SEE": "Sealed Air Corp.", "AVY": "Avery Dennison Corp.",
-    "MMM": "3M Co.", "HON": "Honeywell International Inc.", "TDG": "TransDigm Group Inc.",
-    "HEI": "HEICO Corp.", "CW": "Curtiss-Wright Corp.", "AJRD": "Aerojet Rocketdyne Holdings",
-    "NPK": "National Presto Industries", "ATRO": "Astronics Corp.", "KAMN": "Kaman Corp.",
-    "ESL": "Esterline Technologies Corp.", "COL": "Rockwell Collins Inc.",
-    "UTX": "United Technologies Corp.", "TXT": "Textron Inc.", "ERJ": "Embraer S.A.",
-    "SAFRF": "Safran S.A.", "ROP": "Roper Technologies Inc.", "GWW": "W.W. Grainger Inc.",
-    "FAST": "Fastenal Co.", "MSM": "MSC Industrial Direct Co.", "DKS": "Dick's Sporting Goods Inc.",
-    "ASO": "Academy Sports and Outdoors", "BGFV": "Big 5 Sporting Goods Corp.",
-    "HIBB": "Hibbett Inc.", "FL": "Foot Locker Inc.", "SCVL": "Shoe Carnival Inc.",
-    "BKE": "The Buckle Inc.", "ANF": "Abercrombie & Fitch Co.", "AEO": "American Eagle Outfitters",
-    "URBN": "Urban Outfitters Inc.", "GPS": "Gap Inc.", "JWN": "Nordstrom Inc.",
-    "M": "Macy's Inc.", "KSS": "Kohl's Corp.", "JCP": "J.C. Penney Co.",
-    "SHLDQ": "Sears Holdings Corp.", "BONT": "The Bon-Ton Stores Inc.",
-    "DEST": "Destination Maternity Corp.", "CACH": "Cache Inc.",
-    "PSUN": "Pacific Sunwear of California", "ZUMZ": "Zumiez Inc.", "TLYS": "Tilly's Inc.",
-    "VFC": "VF Corp.", "COLM": "Columbia Sportswear Co.", "DECK": "Deckers Outdoor Corp.",
-    "SKX": "Skechers U.S.A. Inc.", "CROX": "Crocs Inc.", "SHOO": "Steven Madden Ltd.",
-    "RCKY": "Rocky Brands Inc.", "WEYS": "Weyco Group Inc.", "RGS": "Regis Corp.",
-    "EL": "The Estée Lauder Companies", "COTY": "Coty Inc.", "ELF": "e.l.f. Beauty Inc.",
-    "REV": "Revlon Inc.", "IPAR": "Inter Parfums Inc.", "LR": "L'Oréal S.A.",
-    "KHC": "Kraft Heinz Co.", "GIS": "General Mills Inc.", "CPB": "Campbell Soup Co.",
-    "CAG": "Conagra Brands Inc.", "SJM": "J.M. Smucker Co.", "HSY": "The Hershey Co.",
-    "MDLZ": "Mondelez International Inc.", "K": "Kellogg Co.", "POST": "Post Holdings Inc.",
-    "BGS": "B&G Foods Inc.", "FLO": "Flowers Foods Inc.", "LANC": "Lancaster Colony Corp.",
-    "TWNK": "Hostess Brands Inc.", "BIMI": "BIMI International Medical Inc.",
-    "THS": "TreeHouse Foods Inc.", "HAIN": "Hain Celestial Group Inc.",
-    "UNFI": "United Natural Foods Inc.", "SPTN": "SpartanNash Co.", "ANDE": "The Andersons Inc.",
-    "ADM": "Archer-Daniels-Midland Co.", "INGR": "Ingredion Inc.", "BG": "Bunge Ltd.",
-    "AGRO": "Adecoagro S.A.", "TSN": "Tyson Foods Inc.", "HRL": "Hormel Foods Corp.",
-    "PPC": "Pilgrim's Pride Corp.", "SAFM": "Sanderson Farms Inc.", "SEB": "Seaboard Corp.",
-    "CALM": "Cal-Maine Foods Inc.", "PETS": "PetMed Express Inc.", "FRPT": "Freshpet Inc.",
-    "CHWY": "Chewy Inc.", "WOOF": "Petco Health and Wellness Co.", "ZTS": "Zoetis Inc.",
-    "IDXX": "IDEXX Laboratories Inc.", "MASI": "Masimo Corp.", "RMD": "ResMed Inc.",
-    "VAR": "Varian Medical Systems", "EW": "Edwards Lifesciences Corp.", "ABT": "Abbott Laboratories",
-    "MDT": "Medtronic plc", "SYK": "Stryker Corp.", "ZBH": "Zimmer Biomet Holdings",
-    "BSX": "Boston Scientific Corp.", "DXCM": "Dexcom Inc.", "PODD": "Insulet Corp.",
-    "TNDM": "Tandem Diabetes Care Inc.", "ALGN": "Align Technology Inc.",
-    "COO": "The Cooper Companies Inc.", "BAX": "Baxter International Inc.",
-    "FMS": "Fresenius Medical Care AG", "DVA": "DaVita Inc.", "UHS": "Universal Health Services",
-    "CYH": "Community Health Systems", "LPNT": "LifePoint Health Inc.",
-    "HCA": "HCA Healthcare Inc.", "THC": "Tenet Healthcare Corp.", "SEM": "Select Medical Holdings",
-    "ENSG": "The Ensign Group Inc.", "USPH": "U.S. Physical Therapy Inc.",
-    "AMN": "AMN Healthcare Services", "CCRN": "Cross Country Healthcare Inc.",
-    "HSII": "Heidrick & Struggles International", "KFY": "Korn Ferry",
-    "MAN": "ManpowerGroup Inc.", "RHI": "Robert Half International", "ASGN": "ASGN Inc.",
-    "KFRC": "Kforce Inc.", "TBI": "TrueBlue Inc.", "CDK": "CDK Global Inc.",
-    "ADP": "Automatic Data Processing", "PAYX": "Paychex Inc.", "PCTY": "Paylocity Holding Corp.",
-    "PAYC": "Paycom Software Inc.", "WDAY": "Workday Inc.", "ULTI": "The Ultimate Software Group",
-    "CSOD": "Cornerstone OnDemand Inc.", "TLEO": "Taleo Corp.", "SABA": "Saba Software Inc.",
-    "KRON": "Kronos Worldwide Inc.", "TWLO": "Twilio Inc.", "FSLY": "Fastly Inc.",
-    "ESTC": "Elastic N.V.", "SPLK": "Splunk Inc.", "SUMO": "Sumo Logic Inc.",
-    "QLYS": "Qualys Inc.", "TENB": "Tenable Holdings Inc.", "RPD": "Rapid7 Inc.",
-    "VRNS": "Varonis Systems Inc.", "NLOK": "NortonLifeLock Inc.", "PFPT": "Proofpoint Inc.",
-    "MIME": "Mimecast Ltd.", "FEYE": "FireEye Inc.", "ATEN": "A10 Networks Inc.",
-    "RDWR": "Radware Ltd.", "ALLT": "Allot Ltd.", "FFIV": "F5 Inc.",
-    "NTCT": "NetScout Systems Inc.", "ARLO": "Arlo Technologies Inc.", "CALX": "Calix Inc.",
-    "DZSI": "DZS Inc.", "ADTN": "ADTRAN Holdings Inc.", "CIEN": "Ciena Corp.",
-    "INFN": "Infinera Corp.", "IIVI": "II-VI Inc.", "COHR": "Coherent Corp.",
-    "NEO": "NeoPhotonics Corp.", "AAOI": "Applied Optoelectronics Inc.", "NPTN": "NeoPhotonics Corp.",
-    "OCLR": "Oclaro Inc.", "FNSR": "Finisar Corp.", "VIAV": "Viavi Solutions Inc.",
-    "EXFO": "EXFO Inc.", "KEYS": "Keysight Technologies Inc.", "AMKR": "Amkor Technology Inc.",
-    "KLIC": "Kulicke & Soffa Industries", "COHU": "Cohu Inc.", "XPER": "Xperi Holding Corp.",
-    "FORM": "FormFactor Inc.", "PDFS": "PDF Solutions Inc.", "SNPS": "Synopsys Inc.",
-    "CDNS": "Cadence Design Systems", "ANSS": "ANSYS Inc.", "PTC": "PTC Inc.",
-    "ADSK": "Autodesk Inc.", "DSGX": "The Descartes Systems Group", "MANH": "Manhattan Associates Inc.",
-    "BL": "BlackLine Inc.", "MODN": "Model N Inc.", "PRO": "Pros Holdings Inc.",
-    "GUID": "Guidewire Software Inc.", "INST": "Instructure Holdings Inc.", "TWOU": "2U Inc.",
-    "CHGG": "Chegg Inc.", "LRN": "Stride Inc.", "LOPE": "Grand Canyon Education Inc.",
-    "APEI": "American Public Education Inc.", "STRA": "Strategic Education Inc.",
-    "CECO": "Career Education Corp.", "UTI": "Universal Technical Institute",
-    "EDMC": "Education Management Corp.", "DV": "DoubleVerify Holdings Inc.",
-    "MGNI": "Magnite Inc.", "TBLA": "Taboola.com Ltd.", "PERI": "Perion Network Ltd.",
-    "QUOT": "Quotient Technology Inc.", "FLNT": "Fluent Inc.", "CARS": "Cars.com Inc.",
-    "TRIP": "TripAdvisor Inc.", "EXPE": "Expedia Group Inc.", "BKNG": "Booking Holdings Inc.",
-    "TCOM": "Trip.com Group Ltd.", "MMYT": "MakeMyTrip Ltd.", "DESP": "Despegar.com Corp.",
-    "WEB": "Web.com Group Inc.", "GDDY": "GoDaddy Inc.", "WIX": "Wix.com Ltd.",
-    "SQSP": "Squarespace Inc.", "BIGC": "BigCommerce Holdings", "VTEX": "VTEX",
-    "LSPD": "Lightspeed Commerce Inc.", "TOST": "Toast Inc.", "OLO": "Olo Inc.",
+    "SPGI": "S&P Global Inc.", "AON": "Aon plc", "MMC": "Marsh & McLennan Companies",
+    "MET": "MetLife Inc.", "PRU": "Prudential Financial Inc.", "AFL": "Aflac Inc.",
+    "ALL": "Allstate Corp.", "TRV": "Travelers Companies Inc.", "CB": "Chubb Ltd.",
+    "PGR": "Progressive Corp.", "MMM": "3M Co.", "HON": "Honeywell International Inc.",
+    "SNPS": "Synopsys Inc.", "CDNS": "Cadence Design Systems", "ANSS": "ANSYS Inc.",
+    "ADSK": "Autodesk Inc.", "WDAY": "Workday Inc.", "TWLO": "Twilio Inc.",
     "REGN": "Regeneron Pharmaceuticals", "VRTX": "Vertex Pharmaceuticals", "ALNY": "Alnylam Pharmaceuticals",
     "SRPT": "Sarepta Therapeutics", "BMRN": "BioMarin Pharmaceutical", "IONS": "Ionis Pharmaceuticals",
     "EXEL": "Exelixis Inc.", "AMGN": "Amgen Inc.", "GILD": "Gilead Sciences", "BIIB": "Biogen Inc.",
     "MRNA": "Moderna Inc.", "BNTX": "BioNTech SE", "NVAX": "Novavax Inc.",
 }
+
 
 def get_company_name(ticker: str) -> str:
     if ticker in COMPANY_NAMES:
@@ -453,108 +469,106 @@ COUNTRY_ASSETS = {
     "fed": ["SPY", "QQQ", "XLF", "TLT", "KRE", "JPM", "BAC", "BLK"],
     "powell": ["SPY", "QQQ", "XLF", "TLT", "KRE"],
     "europe": ["VGK", "EZU", "EWG", "EWQ", "EWI", "FEZ"],
-    "ecb": ["VGK", "EZU", "EWG", "EWQ", "DB", "UBS", "SAN"],
+    "ecb": ["VGK", "EZU", "EWG", "EWQ", "SAN"],
     "lagarde": ["VGK", "EZU", "EWG", "EWQ"],
     "germany": ["EWG", "VGK", "EZU", "SAP", "SIE", "BMWYY", "VWAGY"],
     "france": ["EWQ", "VGK", "EZU", "TOT", "OR", "SAN", "AIR"],
     "italy": ["EWI", "VGK", "EZU", "ENI", "UCG", "ISP", "LUX"],
-    "spain": ["EWP", "VGK", "EZU", "SAN", "BBVA", "ITX", "TEF"],
+    "spain": ["EWP", "VGK", "EZU", "SAN"],
     "uk": ["EWU", "VGK", "EZU", "HSBC", "BP", "SHEL", "AZN", "UL"],
-    "britain": ["EWU", "VGK", "HSBC", "BP", "SHEL", "AZN"],
-    "boe": ["EWU", "VGK", "HSBC", "BP", "SHEL"],
+    "britain": ["EWU", "VGK", "HSBC", "BP", "SHEL"],
+    "boe": ["EWU", "VGK", "HSBC", "BP"],
     "bailey": ["EWU", "VGK", "HSBC", "BP"],
-    "china": ["FXI", "MCHI", "KWEB", "ASHR", "BABA", "TCEHY", "JD", "PDD"],
-    "taiwan": ["EWT", "FXI", "TSM", "UMC", "ASML"],
-    "japan": ["EWJ", "DXJ", "HEWJ", "TM", "HMC", "SONY", "NTDOY", "SNE"],
-    "india": ["INDA", "EPI", "MINDX", "INFY", "TCS", "WIT", "HDB"],
+    "china": ["FXI", "MCHI", "BABA", "TCEHY"],
+    "taiwan": ["EWT", "FXI", "TSM"],
+    "japan": ["EWJ", "TM", "HMC"],
+    "india": ["INDA", "INFY", "TCS", "WIT", "HDB"],
     "south korea": ["EWY", "SKM", "KB", "KEP", "POSCO", "LPL"],
     "australia": ["EWA", "BHP", "RIO", "WPL", "NAB", "WBC", "ANZ"],
     "israel": ["ISRA", "EIS", "TEVA", "ICL", "CHKP", "CYBR"],
-    "iran": ["USO", "UCO", "BNO", "OIL", "XLE", "CVX", "XOM"],
+    "iran": ["USO", "XLE", "CVX", "XOM"],
     "saudi arabia": ["KSA", "USO", "XLE", "CVX", "XOM"],
     "uae": ["UAE", "USO", "XLE"],
-    "qatar": ["QAT", "USO", "XLE"],
-    "russia": ["RSX", "ERUS", "USO", "GLD", "UNG", "WEAT", "CORN", "SOYB"],
+    "russia": ["RSX", "USO", "GLD", "UNG", "WEAT", "CORN", "SOYB"],
     "ukraine": ["USO", "UNG", "WEAT", "CORN", "SOYB", "GLD", "RSX"],
-    "brazil": ["EWZ", "BRZU", "PBR", "VALE", "ITUB", "BBD"],
+    "brazil": ["EWZ", "PBR", "VALE", "ITUB", "BBD"],
     "mexico": ["EWW", "FMX", "AMX", "CEMEX", "GMEXIC"],
     "argentina": ["ARGT", "GGAL", "YPF", "PAM", "TEO"],
     "gold": ["GLD", "IAU", "PHYS", "GOLD", "NEM", "AEM", "KGC"],
-    "oil": ["USO", "UCO", "BNO", "XLE", "XOM", "CVX", "COP", "OXY"],
-    "natural gas": ["UNG", "BOIL", "KOLD", "KBR", "SWN", "EQT"],
-    "wheat": ["WEAT", "CORN", "SOYB", "DBA", "TEUC", "ADM"],
-    "corn": ["CORN", "WEAT", "SOYB", "DBA", "ADM", "INGR"],
+    "oil": ["USO", "XLE", "XOM", "CVX", "COP", "OXY"],
+    "natural gas": ["UNG", "BOIL"],
+    "wheat": ["WEAT", "CORN", "SOYB"],
+    "corn": ["CORN", "WEAT", "SOYB"],
     "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "BITW", "GBTC", "RIOT", "MARA"],
     "ethereum": ["COIN", "HOOD", "BITW", "ETHE", "RIOT", "MARA", "HIVE"],
 }
 
 KEYWORD_TICKERS = {
     "apple": ["AAPL", "AVGO", "LITE", "QRVO", "SWKS"],
-    "iphone": ["AAPL", "LGL", "CRUS", "STM"],
+    "iphone": ["AAPL", "CRUS", "STM"],
     "microsoft": ["MSFT", "QLYS", "VEEV", "DOCU"],
     "google": ["GOOGL", "GOOG", "TDC", "TRMB"],
     "meta": ["META", "SNAP", "PINS", "MTCH"],
     "nvidia": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "SWKS"],
-    "ai": ["NVDA", "AMD", "PLTR", "AI", "SNOW", "MDB", "DDOG", "NET"],
-    "artificial intelligence": ["NVDA", "AMD", "PLTR", "AI", "SNOW", "MDB"],
+    "ai": ["NVDA", "AMD", "PLTR", "SNOW", "MDB", "DDOG", "NET"],
+    "artificial intelligence": ["NVDA", "AMD", "PLTR", "SNOW", "MDB"],
     "chip": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "SWKS", "QRVO", "MPWR"],
     "semiconductor": ["NVDA", "AMD", "INTC", "MRVL", "QCOM", "AMAT", "LRCX"],
     "cloud": ["MSFT", "AMZN", "GOOGL", "CRM", "NOW", "SNOW", "DDOG", "MDB"],
-    "cybersecurity": ["CRWD", "PANW", "FTNT", "ZS", "OKTA", "CYBR", "S", "NET"],
+    "cybersecurity": ["CRWD", "PANW", "FTNT", "ZS", "OKTA", "CYBR", "NET"],
     "data center": ["NVDA", "AMD", "INTC", "SMCI", "DELL", "HPE", "ANET"],
     "bank": ["JPM", "BAC", "WFC", "C", "GS", "MS", "PNC", "USB", "TFC", "RF"],
     "banca": ["JPM", "BAC", "WFC", "C", "GS", "MS"],
     "credit": ["JPM", "BAC", "WFC", "C", "DFS", "COF", "SYF", "ALLY"],
     "mortgage": ["RKT", "UWMC", "LDI", "PFSI", "COOP"],
-    "oil": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO", "PSX", "MRO", "OXY", "DVN"],
-    "petrolio": ["XOM", "CVX", "COP", "EOG", "MPC", "VLO", "OXY"],
-    "gas": ["XOM", "CVX", "COP", "EOG", "MRO", "DVN", "EQT", "RRC", "SWN"],
-    "energy": ["XOM", "CVX", "COP", "EOG", "XLE", "OXY", "DVN", "MRO", "FANG"],
-    "renewable": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR", "CSIQ", "JKS"],
-    "solar": ["ENPH", "SEDG", "FSLR", "RUN", "NOVA", "SPWR", "CSIQ", "JKS"],
-    "wind": ["GE", "VWDRY", "NPI", "BEP", "NEE", "ORA", "TPIC"],
-    "pharma": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN", "GILD", "BIIB"],
-    "drug": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "AZN", "GILD", "VRTX"],
+    "oil": ["XOM", "CVX", "COP", "OXY"],
+    "petrolio": ["XOM", "CVX", "COP", "OXY"],
+    "gas": ["XOM", "CVX", "COP"],
+    "energy": ["XOM", "CVX", "COP", "XLE", "OXY"],
+    "renewable": ["ENPH", "SEDG", "FSLR"],
+    "solar": ["ENPH", "SEDG", "FSLR"],
+    "wind": ["GE", "NEE"],
+    "pharma": ["JNJ", "PFE", "MRK", "ABBV", "LLY", "NVO", "AZN", "GILD", "BIIB"],
+    "drug": ["JNJ", "PFE", "MRK", "ABBV", "LLY", "NVO", "AZN", "GILD", "VRTX"],
     "vaccine": ["PFE", "MRNA", "BNTX", "NVAX", "GSK", "SNY", "JNJ"],
     "biotech": ["AMGN", "GILD", "BIIB", "VRTX", "REGN", "ALNY", "SRPT", "BMRN"],
-    "fda": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "VRTX", "REGN", "ALNY"],
+    "fda": ["JNJ", "PFE", "MRK", "ABBV", "VRTX", "REGN", "ALNY"],
     "clinical trial": ["BIIB", "VRTX", "REGN", "ALNY", "SRPT", "BMRN", "IONS", "EXEL"],
-    "tesla": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI", "BYDDF"],
-    "ev": ["TSLA", "RIVN", "LCID", "FSR", "NIO", "XPEV", "LI", "QS", "MP"],
+    "tesla": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI"],
+    "ev": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "QS", "MP"],
     "electric vehicle": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "QS", "MP"],
     "automaker": ["F", "GM", "STLA", "TM", "HMC", "HYMTF", "VWAGY", "BMWYY"],
     "car": ["F", "GM", "STLA", "TM", "HMC", "VWAGY", "BMWYY", "RACE"],
-    "battery": ["TSLA", "QS", "MP", "ALB", "SQM", "LTHM", "PLL", "LAC"],
+    "battery": ["TSLA", "QS", "MP", "ALB", "SQM", "LTHM"],
     "bitcoin": ["MSTR", "COIN", "HOOD", "BITO", "BITW", "GBTC", "RIOT", "MARA"],
     "ethereum": ["COIN", "HOOD", "BITW", "ETHE", "RIOT", "MARA", "HIVE", "HUT"],
     "crypto": ["MSTR", "COIN", "HOOD", "BITO", "RIOT", "MARA", "HIVE", "HUT", "BITF"],
     "blockchain": ["IBM", "COIN", "MSTR", "RIOT", "MARA", "SQ", "PYPL"],
-    "real estate": ["VNQ", "SPG", "O", "AMT", "PLD", "WPC", "NNN", "STAG"],
-    "housing": ["DHI", "LEN", "PHM", "TOL", "NVR", "KBH", "MTH", "TMHC", "TPH"],
-    "construction": ["DHI", "LEN", "PHM", "TOL", "CAT", "DE", "URI"],
+    "real estate": ["VNQ", "SPG", "O", "AMT", "PLD"],
+    "housing": ["DHI", "LEN", "PHM", "NVR", "KBH"],
+    "construction": ["DHI", "LEN", "PHM", "CAT", "DE"],
     "gold": ["GLD", "IAU", "PHYS", "GOLD", "NEM", "AEM", "KGC", "WPM", "RGLD", "FNV"],
-    "silver": ["SLV", "PAAS", "HL", "CDE", "EXK", "MAG", "FSM", "SVM"],
+    "silver": ["SLV", "PAAS", "HL", "CDE", "EXK", "MAG"],
     "copper": ["FCX", "SCCO", "TECK", "VALE", "RIO", "BHP", "GLNCY", "ANTO"],
-    "commodity": ["PDBC", "USCI", "GCC", "DJP", "DBC", "GSG", "COMT"],
-    "steel": ["NUE", "STLD", "MT", "VALE", "RIO", "BHP", "CLF", "TX"],
-    "amazon": ["AMZN", "SHOP", "ETSY", "EBAY", "W", "OSTK", "CVNA"],
+    "commodity": ["PDBC", "USCI", "GCC", "DBC", "GSG", "COMT"],
+    "steel": ["NUE", "STLD", "VALE", "RIO", "BHP", "CLF", "TX"],
+    "amazon": ["AMZN", "SHOP", "ETSY", "EBAY", "W"],
     "retail": ["WMT", "TGT", "COST", "HD", "LOW", "BBY", "TJX", "ROST", "BURL"],
-    "consumer": ["PG", "KO", "PEP", "WMT", "COST", "MCD", "SBUX", "DPZ", "YUM"],
-    "defense": ["LMT", "NOC", "RTX", "GD", "BA", "HII", "KTOS", "BWXT"],
-    "aerospace": ["BA", "AIR", "SAFRF", "GE", "HON", "RTX", "LMT", "NOC"],
-    "infrastructure": ["CAT", "DE", "URI", "PCAR", "VMI", "MLI", "TREX", "AWP"],
-    "telecom": ["T", "VZ", "TMUS", "CMCSA", "CHTR", "LUMN", "FYBR", "CNSL"],
+    "consumer": ["KO", "PEP", "WMT", "COST", "MCD", "SBUX", "DPZ", "YUM"],
+    "defense": ["LMT", "RTX", "BA", "HII", "KTOS", "BWXT"],
+    "aerospace": ["BA", "AIR", "GE", "HON", "RTX", "LMT"],
+    "infrastructure": ["CAT", "DE"],
+    "telecom": ["T", "VZ", "TMUS"],
     "streaming": ["NFLX", "DIS", "WBD", "PARA", "ROKU", "FUBO", "AMC", "CNK"],
-    "ozempic": ["NVO", "LLY", "PFE", "MRK", "ABBV", "BMY"],
+    "ozempic": ["NVO", "LLY", "PFE", "MRK", "ABBV"],
     "wegovy": ["NVO", "LLY"],
     "weight loss": ["NVO", "LLY", "PFE", "MRK"],
     "diabetes": ["NVO", "LLY", "PFE", "MRK", "JNJ"],
-    "spacex": ["RKLB", "ASTS", "SPCE", "LUNR", "VORB", "MNTS"],
-    "space": ["RKLB", "ASTS", "SPCE", "LUNR", "VORB", "BA", "LMT"],
-    "paramount": ["PARA", "WBD", "DIS", "NFLX", "CMCSA", "FOX"],
-    "warner": ["WBD", "PARA", "DIS", "NFLX", "CMCSA", "FOX"],
+    "spacex": ["RKLB", "ASTS", "SPCE", "LUNR"],
+    "space": ["RKLB", "ASTS", "SPCE", "LUNR", "BA", "LMT"],
+    "paramount": ["PARA", "WBD", "DIS", "NFLX"],
+    "warner": ["WBD", "PARA", "DIS", "NFLX"],
     "mercedes": ["MBGYY", "VWAGY", "BMWYY", "TM", "HMC", "STLA", "F", "GM"],
-    "vat": ["SPY", "QQQ", "DIA", "XLU", "NEE", "DUK", "SO", "AEP"],
     "electricity": ["XLU", "NEE", "DUK", "SO", "AEP", "EXC", "SRE", "ED"],
     "utility": ["XLU", "NEE", "DUK", "SO", "AEP", "EXC", "SRE", "ED"],
 }
@@ -562,7 +576,7 @@ KEYWORD_TICKERS = {
 SECTOR_ETFS = {
     "Tech": ["XLK", "VGT", "SMH", "SOXX", "IGV"],
     "Banche/Finanza": ["XLF", "VFH", "KRE", "KBE", "IYF"],
-    "Energia": ["XLE", "VDE", "FENY", "OIH", "XOP"],
+    "Energia": ["XLE", "OIH", "XOP"],
     "Farmaceutica/Biotech": ["XBI", "IBB", "VHT", "XLV", "IHI"],
     "Auto/Elettrici": ["DRIV", "IDRV", "LIT", "BATT", "CARZ"],
     "Crypto": ["BITO", "BITW", "WGMI", "BKCH"],
@@ -571,14 +585,14 @@ SECTOR_ETFS = {
     "Indici Globali": ["SPY", "QQQ", "IWM", "DIA", "VTI", "VEU"],
     "Geopolitica/Safe Haven": ["GLD", "IAU", "TLT", "IEF", "VIXY", "SQQQ"],
     "Utility/Energia": ["XLU", "NEE", "DUK", "SO", "AEP"],
-    "Media/Entertainment": ["XLC", "PARA", "WBD", "DIS", "NFLX"],
-    "Space/Aerospace": ["ITA", "BA", "LMT", "NOC", "RTX", "RKLB"],
+    "Media/Entertainment": ["PARA", "WBD", "DIS", "NFLX"],
+    "Space/Aerospace": ["ITA", "BA", "LMT", "RTX", "RKLB"],
 }
 
 SECTOR_KEYWORDS = {
     "Tech": ["apple", "microsoft", "google", "meta", "nvidia", "ai", "artificial intelligence", "chip", "semiconductor", "cloud", "cybersecurity", "data center", "software", "hardware"],
     "Banche/Finanza": ["bank", "banca", "fed", "ecb", "interest rate", "tasso", "banche", "credit", "loan", "mortgage", "central bank", "financial"],
-    "Energia": ["oil", "petrolio", "gas", "energy", "renewable", "solar", "wind", "opec", "electricity", "utility", "vat", "power"],
+    "Energia": ["oil", "petrolio", "gas", "energy", "renewable", "solar", "wind", "opec", "electricity", "utility", "power"],
     "Farmaceutica/Biotech": ["pharma", "drug", "vaccine", "biotech", "fda", "clinical trial", "medicine", "healthcare", "ozempic", "wegovy", "weight loss", "diabetes"],
     "Auto/Elettrici": ["tesla", "ev", "electric vehicle", "automaker", "car", "battery", "mercedes", "auto"],
     "Crypto": ["bitcoin", "ethereum", "crypto", "blockchain"],
@@ -586,10 +600,11 @@ SECTOR_KEYWORDS = {
     "Materie Prime": ["gold", "oro", "silver", "copper", "commodity", "steel"],
     "Indici Globali": ["sp500", "nasdaq", "dow", "ftse", "dax", "nikkei"],
     "Geopolitica/Safe Haven": ["war", "conflict", "sanctions", "tension", "missile", "attack", "invasion", "peace", "treaty", "diplomatic"],
-    "Utility/Energia": ["electricity", "utility", "vat", "power", "grid"],
+    "Utility/Energia": ["electricity", "utility", "power", "grid"],
     "Media/Entertainment": ["paramount", "warner", "streaming", "media", "movie", "film", "tv", "content"],
     "Space/Aerospace": ["spacex", "space", "rocket", "satellite", "launch", "nasa"],
 }
+
 
 def classify_sectors(title: str, summary: str = "") -> List[str]:
     text = (title + " " + summary).lower()
@@ -599,6 +614,7 @@ def classify_sectors(title: str, summary: str = "") -> List[str]:
             affected.append(sector)
     return affected if affected else ["Indici Globali"]
 
+
 def find_countries(title: str, summary: str = "") -> List[Tuple[str, List[str]]]:
     text = (title + " " + summary).lower()
     found = []
@@ -606,6 +622,7 @@ def find_countries(title: str, summary: str = "") -> List[Tuple[str, List[str]]]
         if country in text:
             found.append((country, assets))
     return found
+
 
 def find_tickers_from_news(title: str, summary: str = "") -> Tuple[List[str], List[str], List[Tuple[str, List[str]]]]:
     text = (title + " " + summary).lower()
@@ -629,12 +646,33 @@ def find_tickers_from_news(title: str, summary: str = "") -> Tuple[List[str], Li
     return list(found_tickers)[:8], matched_keywords, countries
 
 # ============================================
+# FETCH CON RETRY
+# ============================================
+
+
+def fetch_with_retry(url: str, timeout: int = 15, max_retries: int = 3, **kwargs) -> requests.Response:
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}, **kwargs)
+            if resp.status_code == 200:
+                return resp
+            logger.warning(f"HTTP {resp.status_code} per {url} (tentativo {attempt + 1})")
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Errore fetch {url}: {e} (tentativo {attempt + 1})")
+        time.sleep(2 ** attempt)
+    raise Exception(f"Fetch fallito dopo {max_retries} tentativi: {url} ({last_err})")
+
+# ============================================
 # DATI STORICI YAHOO FINANCE
 # ============================================
-def get_stock_data(ticker: str, days: int = 30) -> Optional[Dict]:
+
+
+def get_stock_data(ticker: str, days: int = 60) -> Optional[Dict]:
     try:
         end = int(datetime.now().timestamp())
-        start = int((datetime.now() - timedelta(days=days + 5)).timestamp())
+        start = int((datetime.now() - timedelta(days=days + 10)).timestamp())
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={start}&period2={end}&interval=1d"
         resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         data = resp.json()
@@ -648,14 +686,11 @@ def get_stock_data(ticker: str, days: int = 30) -> Optional[Dict]:
         highs = quotes.get("high", [])
         lows = quotes.get("low", [])
         volumes = quotes.get("volume", [])
-        prices = []
-        dates = []
-        vols = []
-        ohlc = []
+        prices, dates, vols, ohlc = [], [], [], []
         for i, (ts, close) in enumerate(zip(timestamps, closes)):
             if close is not None and opens[i] is not None and highs[i] is not None and lows[i] is not None:
                 prices.append(close)
-                dates.append(datetime.fromtimestamp(ts).strftime("%d/%m"))
+                dates.append(datetime.fromtimestamp(ts))
                 vols.append(volumes[i] if volumes[i] else 0)
                 ohlc.append({"open": opens[i], "high": highs[i], "low": lows[i], "close": close})
         if len(prices) < 5:
@@ -681,6 +716,8 @@ def get_stock_data(ticker: str, days: int = 30) -> Optional[Dict]:
 # ============================================
 # INDICATORI TECNICI
 # ============================================
+
+
 def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     if len(prices) < period + 1:
         return None
@@ -690,9 +727,10 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
     if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -703,10 +741,12 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
             rsi = 100 - (100 / (1 + rs))
     return round(rsi, 1)
 
+
 def calculate_sma(prices: List[float], period: int) -> Optional[float]:
     if len(prices) < period:
         return None
-    return round(np.mean(prices[-period:]), 2)
+    return round(float(np.mean(prices[-period:])), 2)
+
 
 def calculate_bollinger(prices: List[float], period: int = 20, std_dev: int = 2) -> Optional[Dict]:
     if len(prices) < period:
@@ -714,32 +754,36 @@ def calculate_bollinger(prices: List[float], period: int = 20, std_dev: int = 2)
     sma = np.mean(prices[-period:])
     std = np.std(prices[-period:])
     return {
-        "upper": round(sma + std_dev * std, 2),
-        "middle": round(sma, 2),
-        "lower": round(sma - std_dev * std, 2),
-        "bandwidth": round((std_dev * std * 2) / sma * 100, 2) if sma else 0
+        "upper": round(float(sma + std_dev * std), 2),
+        "middle": round(float(sma), 2),
+        "lower": round(float(sma - std_dev * std), 2),
+        "bandwidth": round(float((std_dev * std * 2) / sma * 100), 2) if sma else 0.0
     }
+
 
 def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Optional[Dict]:
     if len(prices) < slow + signal:
         return None
+
     def ema(data, period):
         multiplier = 2 / (period + 1)
         ema_values = [np.mean(data[:period])]
         for price in data[period:]:
             ema_values.append((price - ema_values[-1]) * multiplier + ema_values[-1])
         return ema_values
+
     ema_fast = ema(prices, fast)
     ema_slow = ema(prices, slow)
     macd_line = [f - s for f, s in zip(ema_fast[-len(ema_slow):], ema_slow)]
     signal_line = ema(macd_line, signal)
     histogram = [m - s for m, s in zip(macd_line[-len(signal_line):], signal_line)]
     return {
-        "macd": round(macd_line[-1], 3),
-        "signal": round(signal_line[-1], 3),
-        "histogram": round(histogram[-1], 3),
+        "macd": round(float(macd_line[-1]), 3),
+        "signal": round(float(signal_line[-1]), 3),
+        "histogram": round(float(histogram[-1]), 3),
         "trend": "BULLISH" if macd_line[-1] > signal_line[-1] else "BEARISH"
     }
+
 
 def calculate_atr(ohlc: List[Dict], period: int = 14) -> Optional[float]:
     if len(ohlc) < period + 1:
@@ -747,16 +791,46 @@ def calculate_atr(ohlc: List[Dict], period: int = 14) -> Optional[float]:
     tr_values = []
     for i in range(1, len(ohlc)):
         tr1 = ohlc[i]["high"] - ohlc[i]["low"]
-        tr2 = abs(ohlc[i]["high"] - ohlc[i-1]["close"])
-        tr3 = abs(ohlc[i]["low"] - ohlc[i-1]["close"])
+        tr2 = abs(ohlc[i]["high"] - ohlc[i - 1]["close"])
+        tr3 = abs(ohlc[i]["low"] - ohlc[i - 1]["close"])
         tr_values.append(max(tr1, tr2, tr3))
-    return round(np.mean(tr_values[-period:]), 2)
+    return round(float(np.mean(tr_values[-period:])), 2)
+
+
+def calculate_stochastic(prices: List[float], highs: List[float], lows: List[float],
+                          period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Optional[Dict]:
+    if len(prices) < period + smooth_k + smooth_d:
+        return None
+    k_values = []
+    for i in range(period - 1, len(prices)):
+        period_low = min(lows[i - period + 1:i + 1])
+        period_high = max(highs[i - period + 1:i + 1])
+        if period_high - period_low == 0:
+            k_values.append(50.0)
+        else:
+            k_values.append(100 * (prices[i] - period_low) / (period_high - period_low))
+    smoothed_k = [np.mean(k_values[max(0, i - smooth_k + 1):i + 1]) for i in range(len(k_values))]
+    smoothed_d = [np.mean(smoothed_k[max(0, i - smooth_d + 1):i + 1]) for i in range(len(smoothed_k))]
+    k = round(float(smoothed_k[-1]), 1)
+    d = round(float(smoothed_d[-1]), 1)
+    if k > 80 and d > 80:
+        signal_text = "OVERBOUGHT"
+    elif k < 20 and d < 20:
+        signal_text = "OVERSOLD"
+    elif k > d:
+        signal_text = "BULLISH"
+    else:
+        signal_text = "BEARISH"
+    return {"k": k, "d": d, "signal": signal_text}
+
 
 def analyze_volume_trend(volumes: List[int]) -> str:
     if len(volumes) < 5:
         return "N/D"
     recent_avg = np.mean(volumes[-3:])
     older_avg = np.mean(volumes[-6:-3]) if len(volumes) >= 6 else np.mean(volumes[:3])
+    if older_avg == 0:
+        return "N/D"
     if recent_avg > older_avg * 1.2:
         return "CRESCENTE"
     elif recent_avg < older_avg * 0.8:
@@ -764,985 +838,502 @@ def analyze_volume_trend(volumes: List[int]) -> str:
     return "STABILE"
 
 # ============================================
-# CALCOLO LIVELLI TRADING + CONFIDENCE SCORE AVANZATO
+# CALCOLO LIVELLI TRADING + CONFIDENCE SCORE
 # ============================================
+
+
 def calculate_trading_levels(data: Dict) -> Optional[Dict]:
     if not data:
         return None
     prices = data["prices"]
     current = data["current"]
-    high = data["high"]
-    low = data["low"]
-    change = data["change"]
     ohlc = data.get("ohlc", [])
     volumes = data.get("volumes", [])
     company = data.get("company", data["ticker"])
     tc = CFG.get('technical', {})
     tr = CFG.get('trading', {})
-    
-    # Indicatori
+
     rsi = calculate_rsi(prices, tc.get('rsi_period', 14))
     sma20 = calculate_sma(prices, tc.get('sma_short', 20))
     sma50 = calculate_sma(prices, tc.get('sma_long', 50))
     bb = calculate_bollinger(prices, tc.get('bb_period', 20), tc.get('bb_std', 2))
     macd = calculate_macd(prices, tc.get('macd_fast', 12), tc.get('macd_slow', 26), tc.get('macd_signal', 9))
     atr = calculate_atr(ohlc, tc.get('atr_period', 14))
+    highs = [o["high"] for o in ohlc]
+    lows = [o["low"] for o in ohlc]
+    stoch = calculate_stochastic(prices, highs, lows, tc.get('stoch_period', 14)) if ohlc else None
     vol_trend = analyze_volume_trend(volumes)
-    
-    # Estrai highs/lows per stochastic
-    highs = [c["high"] for c in ohlc] if ohlc else prices
-    lows = [c["low"] for c in ohlc] if ohlc else prices
-    stoch = calculate_stochastic(prices, highs, lows)
-    
-    # Determina trend
-    trend_signals = []
-    if sma20 and sma50:
-        if sma20 > sma50:
-            trend_signals.append("bullish_ma")
-        else:
-            trend_signals.append("bearish_ma")
-    if macd:
-        trend_signals.append(macd["trend"].lower())
+
+    # --- Sistema di scoring multi-indicatore ---
+    bullish_signals = 0
+    bearish_signals = 0
+    total_signals = 0
+
     if rsi is not None:
-        if rsi > 60:
-            trend_signals.append("rsi_bullish")
-        elif rsi < 40:
-            trend_signals.append("rsi_bearish")
-    
-    bullish_count = sum(1 for s in trend_signals if "bullish" in s)
-    bearish_count = sum(1 for s in trend_signals if "bearish" in s)
-    
-    if bullish_count > bearish_count:
+        total_signals += 1
+        if rsi < 30:
+            bullish_signals += 1
+        elif rsi > 70:
+            bearish_signals += 1
+
+    if sma20 is not None and sma50 is not None:
+        total_signals += 1
+        if current > sma20 > sma50:
+            bullish_signals += 1
+        elif current < sma20 < sma50:
+            bearish_signals += 1
+
+    if macd is not None:
+        total_signals += 1
+        if macd["trend"] == "BULLISH" and macd["histogram"] > 0:
+            bullish_signals += 1
+        elif macd["trend"] == "BEARISH" and macd["histogram"] < 0:
+            bearish_signals += 1
+
+    if bb is not None:
+        total_signals += 1
+        if current <= bb["lower"]:
+            bullish_signals += 1
+        elif current >= bb["upper"]:
+            bearish_signals += 1
+
+    if stoch is not None:
+        total_signals += 1
+        if stoch["signal"] == "OVERSOLD":
+            bullish_signals += 1
+        elif stoch["signal"] == "OVERBOUGHT":
+            bearish_signals += 1
+
+    if total_signals == 0:
+        return None
+
+    if bullish_signals > bearish_signals:
         position = "LONG"
-        stop_pct = tr.get('stop_loss_long_pct', 0.03)
-        # Entry ideale: pull-back su SMA20 o sopra supporto
-        entry = current
-        if sma20 and current > sma20:
-            entry = round(sma20 * 1.005, 2)  # Leggermente sopra SMA20
-    elif bearish_count > bullish_count:
+        strategy_signal = bullish_signals
+    elif bearish_signals > bullish_signals:
         position = "SHORT"
-        stop_pct = tr.get('stop_loss_short_pct', 0.05)
-        entry = current
-        if sma20 and current < sma20:
-            entry = round(sma20 * 0.995, 2)
+        strategy_signal = bearish_signals
     else:
         position = "NEUTRAL"
-        stop_pct = tr.get('stop_loss_long_pct', 0.03)
-        entry = current
-    
-    # Calcolo ATR-based stop per precisione
-    if atr:
-        atr_stop = round(current - (atr * 2), 2) if position == "LONG" else round(current + (atr * 2), 2)
-        pct_stop = round(current * stop_pct, 2)
-        if position == "LONG":
-            stop_loss = max(atr_stop, current - pct_stop)
-        else:
-            stop_loss = min(atr_stop, current + pct_stop)
+        strategy_signal = 0
+
+    confidence = int(round((strategy_signal / total_signals) * 100)) if total_signals else 0
+    if vol_trend == "CRESCENTE" and position != "NEUTRAL":
+        confidence = min(100, confidence + 10)
+    elif vol_trend == "DECRESCENTE" and position != "NEUTRAL":
+        confidence = max(0, confidence - 5)
+
+    atr_val = atr if atr else round(current * 0.02, 2)
+    sl_mult = tr.get('stop_loss_atr_mult', 1.5)
+    t1_mult = tr.get('target1_atr_mult', 1.0)
+    t2_mult = tr.get('target2_atr_mult', 2.0)
+    t3_mult = tr.get('target3_atr_mult', 3.0)
+
+    if position == "SHORT":
+        stop_loss = round(current + atr_val * sl_mult, 2)
+        target_1 = round(current - atr_val * t1_mult, 2)
+        target_2 = round(current - atr_val * t2_mult, 2)
+        target_3 = round(current - atr_val * t3_mult, 2)
     else:
-        stop_loss = round(current * (1 - stop_pct), 2) if position == "LONG" else round(current * (1 + stop_pct), 2)
-    
-    # Target multipli
-    risk = abs(entry - stop_loss)
-    t1_pct = tr.get('target_1_pct', 0.03)
-    t2_pct = tr.get('target_2_pct', 0.05)
-    t3_pct = tr.get('target_3_pct', 0.10)
-    
-    target_1 = round(entry * (1 + t1_pct), 2) if position == "LONG" else round(entry * (1 - t1_pct), 2)
-    target_2 = round(entry * (1 + t2_pct), 2) if position == "LONG" else round(entry * (1 - t2_pct), 2)
-    target_3 = round(entry * (1 + t3_pct), 2) if position == "LONG" else round(entry * (1 - t3_pct), 2)
-    
-    # Risk/Reward
-    risk_reward_1 = round(abs(target_1 - entry) / risk, 2) if risk > 0 else 0
-    risk_reward_2 = round(abs(target_2 - entry) / risk, 2) if risk > 0 else 0
-    risk_reward_3 = round(abs(target_3 - entry) / risk, 2) if risk > 0 else 0
-    
-    # CONFIDENCE SCORE (0-100) con motivazione dettagliata
-    confidence = 50  # Base
-    reasons = []
-    
-    # Trend alignment
-    if position == "LONG" and bullish_count >= 2:
-        confidence += 15
-        reasons.append(f"✅ Trend rialzista confermato ({bullish_count}/{len(trend_signals)} segnali)")
-    elif position == "SHORT" and bearish_count >= 2:
-        confidence += 15
-        reasons.append(f"✅ Trend ribassista confermato ({bearish_count}/{len(trend_signals)} segnali)")
-    else:
-        confidence -= 10
-        reasons.append("⚠️ Trend non chiaro o in conflitto")
-    
-    # RSI
-    if rsi is not None:
-        if position == "LONG" and 40 < rsi < 70:
-            confidence += 10
-            reasons.append(f"✅ RSI a {rsi} — momentum favorevole (non ipercomprato)")
-        elif position == "SHORT" and 30 < rsi < 60:
-            confidence += 10
-            reasons.append(f"✅ RSI a {rsi} — momentum favorevole (non ipervenduto)")
-        elif (position == "LONG" and rsi > 75) or (position == "SHORT" and rsi < 25):
-            confidence -= 15
-            reasons.append(f"⚠️ RSI estremo ({rsi}) — possibile inversione")
-    
-    # Bollinger
-    if bb:
-        if position == "LONG" and current < bb["lower"] * 1.02:
-            confidence += 10
-            reasons.append("✅ Prezzo vicino banda inferiore Bollinger — potenziale rimbalzo")
-        elif position == "SHORT" and current > bb["upper"] * 0.98:
-            confidence += 10
-            reasons.append("✅ Prezzo vicino banda superiore Bollinger — potenziale correzione")
-    
-    # Volume
-    if vol_trend == "CRESCENTE":
-        confidence += 10
-        reasons.append("✅ Volume in crescita — conferma interesse")
-    elif vol_trend == "DECRESCENTE":
-        confidence -= 5
-        reasons.append("⚠️ Volume in calo — debole conferma")
-    
-    # MACD
-    if macd and abs(macd["histogram"]) > 0.5:
-        confidence += 5
-        reasons.append("✅ MACD con momentum significativo")
-    
-    # Risk/Reward minimo
-    if risk_reward_1 >= 1.5:
-        confidence += 10
-        reasons.append(f"✅ R/R favorevole: {risk_reward_1}:1")
-    elif risk_reward_1 < 1.0:
-        confidence -= 10
-        reasons.append(f"⚠️ R/R sfavorevole: {risk_reward_1}:1")
-    
-    # Stochastic
-    if stoch:
-        if position == "LONG" and stoch["k"] < 30:
-            confidence += 5
-            reasons.append("✅ Stochastic in zona ipervenduto — potenziale rimbalzo")
-        elif position == "SHORT" and stoch["k"] > 70:
-            confidence += 5
-            reasons.append("✅ Stochastic in zona ipercomprato — potenziale correzione")
-    
-    # Limita confidence
-    confidence = max(0, min(100, confidence))
-    
-    # Determina durata posizione in base a confidence e volatilità
-    valid_days = tr.get('valid_days', 7)
-    if confidence >= 80:
-        hold_days = valid_days + 7  # Più sicuro = più lungo
-    elif confidence >= 60:
-        hold_days = valid_days
-    else:
-        hold_days = max(3, valid_days - 2)  # Meno sicuro = più breve
-    
-    valid_until = (datetime.now() + timedelta(days=hold_days)).strftime("%d/%m/%Y")
-    
-    # Determina sicurezza entrata
-    if confidence >= 80:
-        entry_safety = "🟢 ALTA — Entrata consigliata con sizing standard"
-    elif confidence >= 65:
-        entry_safety = "🟡 MEDIA-BUONA — Entrata possibile con sizing ridotto (50-70%)"
-    elif confidence >= 50:
-        entry_safety = "🟠 MEDIA — Attendere conferma o entrare con sizing minimo (25-30%)"
-    else:
-        entry_safety = "🔴 BASSA — Evitare entrata o usare solo paper trading"
-    
+        # LONG e NEUTRAL usano la stessa impostazione direzionale rialzista di default
+        stop_loss = round(current - atr_val * sl_mult, 2)
+        target_1 = round(current + atr_val * t1_mult, 2)
+        target_2 = round(current + atr_val * t2_mult, 2)
+        target_3 = round(current + atr_val * t3_mult, 2)
+
+    valid_days = tr.get('validity_days', 5)
+    valid_until = (datetime.now() + timedelta(days=valid_days)).strftime("%d/%m/%Y")
+    strategy = f"{position} - Multi-indicatore ({strategy_signal}/{total_signals} segnali concordi)"
+
     return {
         "ticker": data["ticker"],
         "company": company,
+        "current": current,
         "position": position,
-        "entry": round(entry, 2),
+        "confidence": confidence,
+        "strategy": strategy,
+        "entry": current,
         "target_1": target_1,
         "target_2": target_2,
         "target_3": target_3,
-        "stop_loss": round(stop_loss, 2),
-        "risk_reward_1": risk_reward_1,
-        "risk_reward_2": risk_reward_2,
-        "risk_reward_3": risk_reward_3,
-        "confidence": confidence,
-        "confidence_reasons": reasons,
-        "entry_safety": entry_safety,
+        "stop_loss": stop_loss,
         "valid_until": valid_until,
-        "hold_days": hold_days,
-        "indicators": {
-            "rsi": rsi,
-            "sma20": sma20,
-            "sma50": sma50,
-            "bb": bb,
-            "macd": macd,
-            "atr": atr,
-            "volume_trend": vol_trend,
-            "stochastic": stoch
-        }
+        "rsi": rsi,
+        "sma20": sma20,
+        "sma50": sma50,
+        "bb": bb,
+        "macd": macd,
+        "atr": atr_val,
+        "stoch": stoch,
+        "vol_trend": vol_trend,
     }
+
 # ============================================
-# GRAFICI AVANZATI CON NOME AZIENDA E DATE
+# GENERAZIONE GRAFICI
 # ============================================
-def create_advanced_chart(data: Dict, levels: Dict, output_path: str = None) -> str:
-    ticker = data["ticker"]
-    company = data.get("company", ticker)
-    prices = data["prices"]
-    dates = data["dates"]
-    volumes = data.get("volumes", [])
-    
-    if output_path is None:
-        output_path = f"chart_{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    
-    # Crea figure con 3 subplots: prezzo, volume, indicatori
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
-    fig.suptitle(f"{ticker} — {company}\\nAnalisi del {datetime.now().strftime('%d/%m/%Y %H:%M')}", 
-                 fontsize=14, fontweight='bold')
-    
-    # Prepara date per asse X
-    x_pos = range(len(prices))
-    
-    # === SUBPLOT 1: Prezzo + Livelli ===
-    ax1 = axes[0]
-    ax1.plot(x_pos, prices, label=f"{ticker} ({company})", color='#1f77b4', linewidth=1.5)
-    
-    # SMA
-    tc = CFG.get('technical', {})
-    sma20_vals = [np.mean(prices[max(0, i-20):i]) for i in range(1, len(prices)+1)]
-    sma50_vals = [np.mean(prices[max(0, i-50):i]) for i in range(1, len(prices)+1)]
-    ax1.plot(x_pos, sma20_vals, '--', color='orange', alpha=0.7, label='SMA 20')
-    ax1.plot(x_pos, sma50_vals, '--', color='purple', alpha=0.7, label='SMA 50')
-    
-    # Livelli trading
-    if levels:
-        entry = levels["entry"]
-        stop = levels["stop_loss"]
-        t1, t2, t3 = levels["target_1"], levels["target_2"], levels["target_3"]
-        
-        ax1.axhline(y=entry, color='blue', linestyle='-', alpha=0.8, label=f'Entry: ${entry}')
-        ax1.axhline(y=stop, color='red', linestyle='-', alpha=0.8, label=f'Stop: ${stop}')
-        ax1.axhline(y=t1, color='green', linestyle=':', alpha=0.7, label=f'T1: ${t1}')
-        ax1.axhline(y=t2, color='green', linestyle='--', alpha=0.7, label=f'T2: ${t2}')
-        ax1.axhline(y=t3, color='green', linestyle='-', alpha=0.7, label=f'T3: ${t3}')
-        
-        # Zone colorate
-        if levels["position"] == "LONG":
-            ax1.axhspan(stop, entry, alpha=0.1, color='red', label='Risk Zone')
-            ax1.axhspan(entry, t3, alpha=0.1, color='green', label='Reward Zone')
-        else:
-            ax1.axhspan(entry, stop, alpha=0.1, color='red')
-            ax1.axhspan(t3, entry, alpha=0.1, color='green')
-    
-    ax1.set_ylabel("Prezzo ($)")
-    ax1.legend(loc='upper left', fontsize=7)
-    ax1.grid(True, alpha=0.3)
-    
-    # Date sull'asse X
-    step = max(1, len(dates) // 8)
-    ax1.set_xticks(x_pos[::step])
-    ax1.set_xticklabels(dates[::step], rotation=45, ha='right', fontsize=7)
-    
-    # === SUBPLOT 2: Volume ===
-    ax2 = axes[1]
-    colors_vol = ['green' if prices[i] >= prices[i-1] else 'red' for i in range(1, len(prices))]
-    colors_vol = ['gray'] + colors_vol
-    ax2.bar(x_pos, volumes, color=colors_vol, alpha=0.6, width=0.8)
-    ax2.set_ylabel("Volume")
-    ax2.set_xticks(x_pos[::step])
-    ax2.set_xticklabels(dates[::step], rotation=45, ha='right', fontsize=7)
-    ax2.grid(True, alpha=0.3)
-    
-    # === SUBPLOT 3: Indicatori ===
-    ax3 = axes[2]
-    ind = levels.get("indicators", {}) if levels else {}
-    
-    # RSI
-    if ind.get("rsi"):
-        rsi_text = f"RSI: {ind['rsi']}"
-        macd_text = f"MACD: {ind['macd']['trend']}" if ind.get('macd') else "MACD: N/D"
-        vol_text = f"Volume: {ind.get('volume_trend', 'N/D')}"
-        conf_text = f"Confidence: {levels['confidence']}/100" if levels else ""
-        
-        info_lines = [
-            f"📊 {ticker} — {company}",
-            f"📅 Data analisi: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-            f"📅 Valida fino al: {levels['valid_until']}" if levels else "",
-            f"⏱️ Durata consigliata: {levels['hold_days']} giorni" if levels else "",
-            f"",
-            f"🎯 Posizione: {levels['position']}" if levels else "",
-            f"🚪 Entry: ${levels['entry']}" if levels else "",
-            f"🛑 Stop Loss: ${levels['stop_loss']}" if levels else "",
-            f"✅ Target 1: ${levels['target_1']} (R/R: {levels['risk_reward_1']}:1)" if levels else "",
-            f"✅ Target 2: ${levels['target_2']} (R/R: {levels['risk_reward_2']}:1)" if levels else "",
-            f"✅ Target 3: ${levels['target_3']} (R/R: {levels['risk_reward_3']}:1)" if levels else "",
-            f"",
-            rsi_text,
-            macd_text,
-            vol_text,
-            conf_text,
-            f"",
-            f"{levels.get('entry_safety', '')}" if levels else ""
-        ]
-        
-        ax3.axis('off')
-        y_start = 0.95
-        for line in info_lines:
-            if line:
-                ax3.text(0.02, y_start, line, transform=ax3.transAxes, fontsize=9, 
-                        verticalalignment='top', fontfamily='monospace',
-                        color='darkgreen' if '✅' in line else 'darkred' if '🛑' in line or '🔴' in line else 'black')
-                y_start -= 0.06
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    logger.info(f"Grafico salvato: {output_path}")
-    return output_path
+
+
+def generate_chart(data: Dict, levels: Optional[Dict]) -> Optional[str]:
+    if not CFG.get('charts', {}).get('enabled', True):
+        return None
+    try:
+        prices = data["prices"]
+        dates = data["dates"]
+        ticker = data["ticker"]
+        company = data.get("company", ticker)
+
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]}, sharex=True
+        )
+
+        ax1.plot(dates, prices, color="#1f77b4", linewidth=1.6, label="Prezzo")
+
+        sma20_period = CFG.get('technical', {}).get('sma_short', 20)
+        sma50_period = CFG.get('technical', {}).get('sma_long', 50)
+        if len(prices) >= sma20_period:
+            sma20_series = [np.mean(prices[max(0, i - sma20_period + 1):i + 1]) for i in range(len(prices))]
+            ax1.plot(dates, sma20_series, color="#ff7f0e", linewidth=1.0, label=f"SMA{sma20_period}")
+        if len(prices) >= sma50_period:
+            sma50_series = [np.mean(prices[max(0, i - sma50_period + 1):i + 1]) for i in range(len(prices))]
+            ax1.plot(dates, sma50_series, color="#2ca02c", linewidth=1.0, label=f"SMA{sma50_period}")
+
+        if levels:
+            ax1.axhline(levels["target_1"], color="green", linestyle="--", linewidth=0.9, alpha=0.7, label="Target 1")
+            ax1.axhline(levels["target_2"], color="green", linestyle=":", linewidth=0.9, alpha=0.5, label="Target 2")
+            ax1.axhline(levels["stop_loss"], color="red", linestyle="--", linewidth=0.9, alpha=0.7, label="Stop Loss")
+            if levels.get("bb"):
+                ax1.axhline(levels["bb"]["upper"], color="gray", linestyle=":", linewidth=0.7, alpha=0.5)
+                ax1.axhline(levels["bb"]["lower"], color="gray", linestyle=":", linewidth=0.7, alpha=0.5)
+
+        title_conf = f" | Confidence {levels['confidence']}% ({levels['position']})" if levels else ""
+        ax1.set_title(f"{company} ({ticker}){title_conf}", fontsize=12, fontweight="bold")
+        ax1.set_ylabel("Prezzo (USD)")
+        ax1.legend(loc="upper left", fontsize=8)
+        ax1.grid(alpha=0.3)
+
+        volumes = data.get("volumes", [])
+        if volumes:
+            ax2.bar(dates, volumes, color="#7f7f7f", alpha=0.6)
+        ax2.set_ylabel("Volume")
+        ax2.grid(alpha=0.3)
+
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+        fig.autofmt_xdate()
+        fig.tight_layout()
+
+        filename = CHARTS_DIR / f"{ticker}_{int(time.time())}.png"
+        fig.savefig(filename, dpi=110)
+        plt.close(fig)
+        return str(filename)
+    except Exception as e:
+        logger.error(f"Errore generazione grafico per {data.get('ticker')}: {e}")
+        return None
+
 # ============================================
-# TELEGRAM (con retry)
+# RSS / NEWS
 # ============================================
-def send_telegram_message(text: str, chat_id: str = None, max_retries: int = 3) -> bool:
-    chat_id = chat_id or CHAT_ID
-    if not TELEGRAM_TOKEN or not chat_id:
-        logger.warning("Telegram non configurato")
+
+
+def clean_html(raw: str) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html_lib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_rss_entries(url: str, category: str) -> List[Dict]:
+    entries = []
+    try:
+        resp = fetch_with_retry(url, timeout=15, max_retries=2)
+        parsed = feedparser.parse(resp.content)
+        for entry in parsed.entries:
+            title = clean_html(entry.get("title", ""))
+            summary = clean_html(entry.get("summary", entry.get("description", "")))
+            link = entry.get("link", "")
+            if not title:
+                continue
+            entries.append({
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "source": url,
+                "category": category,
+            })
+    except Exception as e:
+        logger.warning(f"Impossibile leggere il feed {url}: {e}")
+    return entries
+
+
+def gather_news() -> List[Dict]:
+    all_entries = []
+    for url in CFG['sources'].get('finance', []):
+        all_entries.extend(fetch_rss_entries(url, "finance"))
+        watchdog.heartbeat()
+    for url in CFG['sources'].get('geopol', []):
+        all_entries.extend(fetch_rss_entries(url, "geopol"))
+        watchdog.heartbeat()
+    logger.info(f"Raccolte {len(all_entries)} notizie totali dai feed RSS")
+    return all_entries
+
+# ============================================
+# TELEGRAM
+# ============================================
+
+
+def escape_html(text: str) -> str:
+    return html_lib.escape(text or "", quote=False)
+
+
+def send_telegram_message(text: str, max_retries: int = 3) -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("Token o Chat ID Telegram non configurati: messaggio non inviato")
         return False
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-    
+    payload = {"chat_id": CHAT_ID, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True}
     for attempt in range(max_retries):
         try:
             resp = requests.post(url, json=payload, timeout=15)
             if resp.status_code == 200:
                 return True
-            logger.warning(f"Telegram HTTP {resp.status_code}: {resp.text[:200]}")
+            logger.warning(f"Telegram HTTP {resp.status_code}: {resp.text[:200]} (tentativo {attempt + 1})")
         except Exception as e:
-            logger.warning(f"Telegram errore (tentativo {attempt+1}): {e}")
-            time.sleep(2 ** attempt)
+            logger.warning(f"Errore invio Telegram: {e} (tentativo {attempt + 1})")
+        time.sleep(2 ** attempt)
     return False
 
-def send_telegram_photo(photo_path: str, caption: str = "", chat_id: str = None) -> bool:
-    chat_id = chat_id or CHAT_ID
-    if not TELEGRAM_TOKEN or not chat_id:
+
+def send_telegram_photo(photo_path: str, caption: str = "", max_retries: int = 3) -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    for attempt in range(3):
-        try:
-            with open(photo_path, 'rb') as f:
-                files = {'photo': f}
-                data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
-                resp = requests.post(url, files=files, data=data, timeout=30)
-                if resp.status_code == 200:
-                    return True
-                logger.warning(f"Telegram photo HTTP {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Telegram photo errore: {e}")
-            time.sleep(2 ** attempt)
-    return False
-
-# ============================================
-# FETCH NEWS (con filtri e deduplicazione)
-# ============================================
-def fetch_news_feed(url: str, max_items: int = 3) -> List[Dict]:
-    try:
-        resp = fetch_with_retry(url, timeout=15)
-        feed = feedparser.parse(resp.content)
-        news = []
-        for entry in feed.entries[:max_items]:
-            title = entry.get('title', '').strip()
-            summary = entry.get('summary', '')[:300]
-            published = entry.get('published', '')
-            link = entry.get('link', '')
-            if title and not db.is_news_sent(title):
-                news.append({
-                    'title': title,
-                    'summary': summary,
-                    'published': published,
-                    'link': link,
-                    'source': url
-                })
-        return news
-    except Exception as e:
-        logger.error(f"Errore fetch feed {url}: {e}")
-        return []
-
-def process_news_item(item: Dict) -> Optional[Dict]:
-    title = item['title']
-    summary = item.get('summary', '')
-    
-    tickers, keywords, countries = find_tickers_from_news(title, summary)
-    if not tickers:
-        return None
-    
-    sectors = classify_sectors(title, summary)
-    
-    return {
-        'title': title,
-        'summary': summary,
-        'published': item.get('published', ''),
-        'link': item.get('link', ''),
-        'tickers': tickers[:CFG.get('limits', {}).get('max_tickers_per_news', 4)],
-        'keywords': keywords,
-        'countries': [c[0] for c in countries],
-        'sectors': sectors
-    }
-
-# ============================================
-# FORMATTAZIONE MESSAGGIO AVANZATA
-# ============================================
-def format_prediction_message(pred: Dict, news_title: str = "") -> str:
-    company = pred.get("company", pred["ticker"])
-    lines = [
-        f"📈 *SIGNAL: {pred['ticker']} — {company}*",
-        f"",
-        f"📰 *Notizia trigger:* {news_title}" if news_title else "",
-        f"",
-        f"📊 *Setup:* {pred['position']}",
-        f"🚪 *Entry:* `${pred['entry']}`",
-        f"🛑 *Stop Loss:* `${pred['stop_loss']}`",
-        f"✅ *Target 1:* `${pred['target_1']}` (R/R: {pred['risk_reward_1']}:1)",
-        f"✅ *Target 2:* `${pred['target_2']}` (R/R: {pred['risk_reward_2']}:1)",
-        f"✅ *Target 3:* `${pred['target_3']}` (R/R: {pred['risk_reward_3']}:1)",
-        f"",
-        f"🛡️ *Sicurezza Entrata:* {pred['entry_safety']}",
-        f"🎯 *Confidence Score:* {pred['confidence']}/100",
-        f"",
-        f"📅 *Data analisi:* {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-        f"📅 *Valido fino al:* {pred['valid_until']}",
-        f"⏱️ *Durata posizione:* {pred['hold_days']} giorni",
-        f"",
-        f"📋 *Motivazione Confidence:*"
-    ]
-    
-    for reason in pred.get('confidence_reasons', []):
-        lines.append(f"   {reason}")
-    
-    lines.append(f"")
-    lines.append(f"📉 *Indicatori:*")
-    ind = pred.get('indicators', {})
-    if ind.get('rsi'):
-        lines.append(f"   • RSI(14): {ind['rsi']}")
-    if ind.get('sma20'):
-        lines.append(f"   • SMA20: ${ind['sma20']}")
-    if ind.get('sma50'):
-        lines.append(f"   • SMA50: ${ind['sma50']}")
-    if ind.get('macd'):
-        lines.append(f"   • MACD: {ind['macd']['trend']} (hist: {ind['macd']['histogram']})")
-    if ind.get('atr'):
-        lines.append(f"   • ATR(14): ${ind['atr']}")
-    if ind.get('volume_trend'):
-        lines.append(f"   • Volume: {ind['volume_trend']}")
-    
-    return "\\n".join([l for l in lines if l])
-
-# ============================================
-# HEARTBEAT
-# ============================================
-def send_heartbeat():
-    try:
-        import psutil
-        process = psutil.Process()
-        mem_mb = process.memory_info().rss / 1024 / 1024
-        uptime_hours = (time.time() - START_TIME) / 3600
-    except:
-        mem_mb = 0
-        uptime_hours = (time.time() - START_TIME) / 3600
-    
-    db.log_heartbeat("OK", mem_mb, uptime_hours)
-    watchdog.heartbeat()
-    
-    # Invia heartbeat a Telegram solo ogni 6 cicli (configurabile)
-    hb_cfg = CFG.get('heartbeat', {})
-    if hb_cfg.get('enabled', True):
-        interval_runs = hb_cfg.get('interval_runs', 6)
-        # Il heartbeat Telegram viene gestito nel main loop contando i cicli
-
-# ============================================
-# MAIN LOOP
-# ============================================
-START_TIME = time.time()
-
-def run_cycle():
-    start_ts = time.time()
-    logger.info("=" * 50)
-    logger.info("INIZIO CICLO ANALISI")
-    logger.info("=" * 50)
-    
-    news_count = 0
-    charts_count = 0
-    error_msg = ""
-    
-    try:
-        # Cleanup DB vecchio
-        db.cleanup_old_news(30)
-        
-        # Fetch finance news
-        finance_sources = CFG.get('sources', {}).get('finance', [])
-        geopol_sources = CFG.get('sources', {}).get('geopol', [])
-        limits = CFG.get('limits', {})
-        
-        all_news = []
-        for url in finance_sources[:limits.get('max_finance_news', 5)]:
-            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
-            all_news.extend(news)
-        
-        for url in geopol_sources[:limits.get('max_geopol_news', 5)]:
-            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
-            all_news.extend(news)
-        
-        logger.info(f"Notizie fresche trovate: {len(all_news)}")
-        
-        processed = []
-        for item in all_news:
-            result = process_news_item(item)
-            if result:
-                processed.append(result)
-                db.mark_news_sent(item['title'], result['tickers'])
-        
-        # Analisi e invio
-        for news in processed:
-            for ticker in news['tickers']:
-                data = get_stock_data(ticker)
-                if not data:
-                    continue
-                
-                levels = calculate_trading_levels(data)
-                if not levels:
-                    continue
-                
-                # Salva prediction
-                db.save_prediction(
-                    ticker=ticker,
-                    company_name=levels['company'],
-                    strategy=levels['position'],
-                    entry=levels['entry'],
-                    target_1=levels['target_1'],
-                    target_2=levels['target_2'],
-                    target_3=levels['target_3'],
-                    stop_loss=levels['stop_loss'],
-                    confidence=levels['confidence'],
-                    confidence_reason=" | ".join(levels['confidence_reasons']),
-                    position=levels['position'],
-                    valid_until=levels['valid_until'],
-                    hold_days=levels['hold_days']
-                )
-                
-                # Genera e invia grafico
-                chart_path = create_advanced_chart(data, levels)
-                msg = format_prediction_message(levels, news['title'])
-                
-                send_telegram_message(msg)
-                send_telegram_photo(chart_path, caption=f"{ticker} — {levels['company']}")
-                
-                charts_count += 1
-                news_count += 1
-                
-                # Rimuovi file grafico
-                try:
-                    os.remove(chart_path)
-                except:
-                    pass
-        
-        duration = time.time() - start_ts
-        db.log_execution("SUCCESS", news_count, charts_count, "", duration)
-        logger.info(f"Ciclo completato: {news_count} notizie, {charts_count} chart in {duration:.1f}s")
-        
-    except Exception as e:
-        error_msg = str(e)
-        duration = time.time() - start_ts
-        db.log_execution("ERROR", news_count, charts_count, error_msg, duration)
-        logger.exception(f"Errore ciclo: {e}")
-        send_telegram_message(f"⚠️ *ERRORE CICLO*\\n\\n```{error_msg[:500]}```")
-    
-    return news_count, charts_count
-
-def main():
-    logger.info("=" * 50)
-    logger.info("FINANCE NEWS AGENT v4.0 AVVIATO")
-    logger.info("=" * 50)
-    
-    # Avvia watchdog
-    watchdog.start()
-    
-    # Invia messaggio di avvio
-    send_telegram_message(
-        f"🚀 *Finance News Agent v4.0 Avviato*\\n\\n"
-        f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}\\n"
-        f"⏱️ Intervallo: {RUN_INTERVAL_HOURS}h\\n"
-        f"💾 DB: {DB_PATH}"
-    )
-    
-    cycle_count = 0
-    hb_cfg = CFG.get('heartbeat', {})
-    hb_interval = hb_cfg.get('interval_runs', 6)
-    
-    while True:
-        global WATCHDOG_TRIGGERED
-        if WATCHDOG_TRIGGERED:
-            logger.warning("Watchdog triggered! Riavvio ciclo...")
-            WATCHDOG_TRIGGERED = False
-        
-        try:
-            run_cycle()
-            cycle_count += 1
-            
-            # Heartbeat Telegram periodico
-            if cycle_count % hb_interval == 0 and hb_cfg.get('enabled', True):
-                uptime = (time.time() - START_TIME) / 3600
-                send_telegram_message(
-                    f"💓 *Heartbeat*\\n\\n"
-                    f"Cicli completati: {cycle_count}\\n"
-                    f"Uptime: {uptime:.1f}h\\n"
-                    f"Prossimo ciclo: {RUN_INTERVAL_HOURS}h"
-                )
-            
-        except Exception as e:
-            logger.exception(f"Errore grave nel main loop: {e}")
-            send_telegram_message(f"🚨 *ERRORE GRAVE*\\n\\n```{str(e)[:500]}```")
-        
-        # Sleep con check interrupt
-        sleep_seconds = RUN_INTERVAL_HOURS * 3600
-        logger.info(f"Sleep per {RUN_INTERVAL_HOURS}h...")
-        
-        for _ in range(sleep_seconds):
-            if WATCHDOG_TRIGGERED:
-                break
-            time.sleep(1)
-
-if __name__ == "__main__":
-    # Gestione segnali
-    def signal_handler(signum, frame):
-        logger.info("Segnale di arresto ricevuto")
-        watchdog.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # ============================================
-# TELEGRAM (con retry)
-# ============================================
-def send_telegram_message(text: str, chat_id: str = None, max_retries: int = 3) -> bool:
-    chat_id = chat_id or CHAT_ID
-    if not TELEGRAM_TOKEN or not chat_id:
-        logger.warning("Telegram non configurato")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, json=payload, timeout=15)
+            with open(photo_path, "rb") as photo_file:
+                files = {"photo": photo_file}
+                data = {"chat_id": CHAT_ID, "caption": caption[:1024], "parse_mode": "HTML"}
+                resp = requests.post(url, data=data, files=files, timeout=30)
             if resp.status_code == 200:
                 return True
-            logger.warning(f"Telegram HTTP {resp.status_code}: {resp.text[:200]}")
+            logger.warning(f"Telegram photo HTTP {resp.status_code} (tentativo {attempt + 1})")
         except Exception as e:
-            logger.warning(f"Telegram errore (tentativo {attempt+1}): {e}")
-            time.sleep(2 ** attempt)
-    return False
-
-def send_telegram_photo(photo_path: str, caption: str = "", chat_id: str = None) -> bool:
-    chat_id = chat_id or CHAT_ID
-    if not TELEGRAM_TOKEN or not chat_id:
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    for attempt in range(3):
-        try:
-            with open(photo_path, 'rb') as f:
-                files = {'photo': f}
-                data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
-                resp = requests.post(url, files=files, data=data, timeout=30)
-                if resp.status_code == 200:
-                    return True
-                logger.warning(f"Telegram photo HTTP {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Telegram photo errore: {e}")
-            time.sleep(2 ** attempt)
+            logger.warning(f"Errore invio foto Telegram: {e} (tentativo {attempt + 1})")
+        time.sleep(2 ** attempt)
     return False
 
 # ============================================
-# FETCH NEWS (con filtri e deduplicazione)
+# COSTRUZIONE MESSAGGIO
 # ============================================
-def fetch_news_feed(url: str, max_items: int = 3) -> List[Dict]:
-    try:
-        resp = fetch_with_retry(url, timeout=15)
-        feed = feedparser.parse(resp.content)
-        news = []
-        for entry in feed.entries[:max_items]:
-            title = entry.get('title', '').strip()
-            summary = entry.get('summary', '')[:300]
-            published = entry.get('published', '')
-            link = entry.get('link', '')
-            if title and not db.is_news_sent(title):
-                news.append({
-                    'title': title,
-                    'summary': summary,
-                    'published': published,
-                    'link': link,
-                    'source': url
-                })
-        return news
-    except Exception as e:
-        logger.error(f"Errore fetch feed {url}: {e}")
-        return []
 
-def process_news_item(item: Dict) -> Optional[Dict]:
-    title = item['title']
-    summary = item.get('summary', '')
 
-    tickers, keywords, countries = find_tickers_from_news(title, summary)
-    if not tickers:
+def build_message(entry: Dict, tickers_levels: List[Dict], sectors: List[str],
+                   countries: List[Tuple[str, List[str]]]) -> str:
+    cat_label = "📊 FINANZA" if entry["category"] == "finance" else "🌍 GEOPOLITICA"
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    lines = [f"<b>{cat_label}</b> — {now_str}", "", f"<b>{escape_html(entry['title'])}</b>"]
+    if entry.get("summary"):
+        summary_short = entry["summary"][:300]
+        lines.append(escape_html(summary_short) + ("…" if len(entry["summary"]) > 300 else ""))
+    if entry.get("link"):
+        lines.append(f'<a href="{escape_html(entry["link"])}">Fonte completa</a>')
+
+    if sectors:
+        lines.append("")
+        lines.append(f"<b>Settori coinvolti:</b> {escape_html(', '.join(sectors))}")
+    if countries:
+        country_names = ", ".join(c[0].title() for c in countries)
+        lines.append(f"<b>Paesi/Aree citati:</b> {escape_html(country_names)}")
+
+    if tickers_levels:
+        lines.append("")
+        lines.append("<b>📈 Analisi tecnica ticker collegati:</b>")
+        for lv in tickers_levels:
+            emoji = "🟢" if lv["position"] == "LONG" else ("🔴" if lv["position"] == "SHORT" else "⚪")
+            lines.append(
+                f"\n{emoji} <b>{escape_html(lv['ticker'])}</b> — {escape_html(lv['company'])}\n"
+                f"Prezzo attuale: {lv['current']:.2f} | Posizione: {lv['position']} | Confidence: {lv['confidence']}%\n"
+                f"Entry: {lv['entry']:.2f} | T1: {lv['target_1']:.2f} | T2: {lv['target_2']:.2f} | T3: {lv['target_3']:.2f} | SL: {lv['stop_loss']:.2f}\n"
+                f"RSI: {lv['rsi']} | Volume: {lv['vol_trend']} | Valido fino al {lv['valid_until']}"
+            )
+    return "\n".join(lines)
+
+# ============================================
+# ELABORAZIONE SINGOLA NOTIZIA
+# ============================================
+
+
+def process_news_item(entry: Dict, charts_budget: List[int]) -> Optional[Dict]:
+    tickers, keywords, countries = find_tickers_from_news(entry["title"], entry["summary"])
+    sectors = classify_sectors(entry["title"], entry["summary"])
+    max_tickers = CFG['limits'].get('max_tickers_per_news', 3)
+
+    tickers_levels = []
+    chart_paths = []
+    for ticker in tickers[:max_tickers]:
+        stock_data = get_stock_data(ticker)
+        watchdog.heartbeat()
+        if not stock_data:
+            continue
+        levels = calculate_trading_levels(stock_data)
+        if not levels:
+            continue
+        tickers_levels.append(levels)
+        if charts_budget[0] > 0:
+            chart_path = generate_chart(stock_data, levels)
+            if chart_path:
+                chart_paths.append((ticker, chart_path))
+                charts_budget[0] -= 1
+
+    if not tickers_levels and not sectors:
         return None
 
-    sectors = classify_sectors(title, summary)
-
+    message = build_message(entry, tickers_levels, sectors, countries)
     return {
-        'title': title,
-        'summary': summary,
-        'published': item.get('published', ''),
-        'link': item.get('link', ''),
-        'tickers': tickers[:CFG.get('limits', {}).get('max_tickers_per_news', 4)],
-        'keywords': keywords,
-        'countries': [c[0] for c in countries],
-        'sectors': sectors
+        "message": message,
+        "tickers": [lv["ticker"] for lv in tickers_levels],
+        "levels": tickers_levels,
+        "charts": chart_paths,
+        "title": entry["title"],
     }
 
 # ============================================
-# FORMATTAZIONE MESSAGGIO AVANZATA
+# CICLO PRINCIPALE
 # ============================================
-def format_prediction_message(pred: Dict, news_title: str = "") -> str:
-    company = pred.get("company", pred["ticker"])
-    lines = [
-        f"**SIGNAL: {pred['ticker']} - {company}**",
-        "",
-        f"**Notizia trigger:** {news_title}" if news_title else "",
-        "",
-        f"**Setup:** {pred['position']}",
-        f"**Entry:** ${pred['entry']}",
-        f"**Stop Loss:** ${pred['stop_loss']}",
-        f"**Target 1:** ${pred['target_1']} (R/R: {pred['risk_reward_1']}:1)",
-        f"**Target 2:** ${pred['target_2']} (R/R: {pred['risk_reward_2']}:1)",
-        f"**Target 3:** ${pred['target_3']} (R/R: {pred['risk_reward_3']}:1)",
-        "",
-        f"**Sicurezza Entrata:** {pred['entry_safety']}",
-        f"**Confidence Score:** {pred['confidence']}/100",
-        "",
-        f"**Data analisi:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-        f"**Valido fino al:** {pred['valid_until']}",
-        f"**Durata posizione:** {pred['hold_days']} giorni",
-        "",
-        "**Motivazione Confidence:**"
-    ]
 
-    for reason in pred.get('confidence_reasons', []):
-        lines.append(f" {reason}")
-
-    lines.append("")
-    lines.append("**Indicatori:**")
-    ind = pred.get('indicators', {})
-    if ind.get('rsi'):
-        lines.append(f" - RSI(14): {ind['rsi']}")
-    if ind.get('sma20'):
-        lines.append(f" - SMA20: ${ind['sma20']}")
-    if ind.get('sma50'):
-        lines.append(f" - SMA50: ${ind['sma50']}")
-    if ind.get('macd'):
-        lines.append(f" - MACD: {ind['macd']['trend']} (hist: {ind['macd']['histogram']})")
-    if ind.get('atr'):
-        lines.append(f" - ATR(14): ${ind['atr']}")
-    if ind.get('stochastic'):
-        lines.append(f" - Stoch(14,3): K={ind['stochastic']['k']} D={ind['stochastic']['d']} [{ind['stochastic']['signal']}]")
-    if ind.get('volume_trend'):
-        lines.append(f" - Volume: {ind['volume_trend']}")
-
-    return "\n".join([l for l in lines if l])
-
-# ============================================
-# HEARTBEAT
-# ============================================
-def send_heartbeat():
-    try:
-        import psutil
-        process = psutil.Process()
-        mem_mb = process.memory_info().rss / 1024 / 1024
-        uptime_hours = (time.time() - START_TIME) / 3600
-    except:
-        mem_mb = 0
-        uptime_hours = (time.time() - START_TIME) / 3600
-
-    db.log_heartbeat("OK", mem_mb, uptime_hours)
-    watchdog.heartbeat()
-
-# ============================================
-# MAIN LOOP
-# ============================================
-START_TIME = time.time()
 
 def run_cycle():
-    start_ts = time.time()
-    logger.info("=" * 50)
-    logger.info("INIZIO CICLO ANALISI")
-    logger.info("=" * 50)
-
-    news_count = 0
-    charts_count = 0
+    start_time = time.time()
+    watchdog.start()
+    news_sent = 0
+    charts_sent = 0
+    status = "OK"
     error_msg = ""
-
     try:
-        # Cleanup DB vecchio
-        db.cleanup_old_news(30)
+        all_entries = gather_news()
+        max_news = CFG['limits'].get('max_news_per_cycle', 10)
+        charts_budget = [CFG['limits'].get('max_charts_per_cycle', 8)]
 
-        # Fetch finance news
-        finance_sources = CFG.get('sources', {}).get('finance', [])
-        geopol_sources = CFG.get('sources', {}).get('geopol', [])
-        limits = CFG.get('limits', {})
+        for entry in all_entries:
+            if news_sent >= max_news:
+                logger.info("Limite massimo di notizie per ciclo raggiunto")
+                break
+            if db.is_news_sent(entry["title"]):
+                continue
 
-        all_news = []
-        for url in finance_sources[:limits.get('max_finance_news', 5)]:
-            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
-            all_news.extend(news)
+            watchdog.heartbeat()
+            try:
+                result = process_news_item(entry, charts_budget)
+            except Exception as e:
+                logger.error(f"Errore elaborazione notizia '{entry['title'][:60]}': {e}")
+                continue
 
-        for url in geopol_sources[:limits.get('max_geopol_news', 5)]:
-            news = fetch_news_feed(url, limits.get('max_news_per_source', 2))
-            all_news.extend(news)
+            if not result:
+                db.mark_news_sent(entry["title"], [])
+                continue
 
-        logger.info(f"Notizie fresche trovate: {len(all_news)}")
+            sent_ok = send_telegram_message(result["message"])
+            if sent_ok:
+                for ticker, chart_path in result["charts"]:
+                    send_telegram_photo(chart_path, caption=f"Grafico tecnico {ticker}")
+                    charts_sent += 1
+                for lv in result["levels"]:
+                    db.save_prediction(
+                        lv["ticker"], lv["company"], lv["strategy"], lv["entry"],
+                        lv["target_1"], lv["target_2"], lv["target_3"], lv["stop_loss"],
+                        lv["confidence"], lv["position"], lv["valid_until"]
+                    )
+                db.mark_news_sent(entry["title"], result["tickers"])
+                news_sent += 1
+                logger.info(f"Notizia inviata: {result['title'][:70]}")
+            else:
+                logger.warning(f"Invio Telegram fallito per: {entry['title'][:70]}")
 
-        processed = []
-        for item in all_news:
-            result = process_news_item(item)
-            if result:
-                processed.append(result)
-                db.mark_news_sent(item['title'], result['tickers'])
-
-        # Analisi e invio
-        for news in processed:
-            for ticker in news['tickers']:
-                data = get_stock_data(ticker)
-                if not data:
-                    continue
-
-                levels = calculate_trading_levels(data)
-                if not levels:
-                    continue
-
-                # Salva prediction
-                db.save_prediction(
-                    ticker=ticker,
-                    company_name=levels['company'],
-                    strategy=levels['position'],
-                    entry=levels['entry'],
-                    target_1=levels['target_1'],
-                    target_2=levels['target_2'],
-                    target_3=levels['target_3'],
-                    stop_loss=levels['stop_loss'],
-                    confidence=levels['confidence'],
-                    confidence_reason=" | ".join(levels['confidence_reasons']),
-                    position=levels['position'],
-                    valid_until=levels['valid_until'],
-                    hold_days=levels['hold_days']
-                )
-
-                # Genera e invia grafico
-                chart_path = create_advanced_chart(data, levels)
-                msg = format_prediction_message(levels, news['title'])
-
-                send_telegram_message(msg)
-                send_telegram_photo(chart_path, caption=f"{ticker} - {levels['company']}")
-
-                charts_count += 1
-                news_count += 1
-
-                # Rimuovi file grafico
-                try:
-                    os.remove(chart_path)
-                except:
-                    pass
-
-        duration = time.time() - start_ts
-        db.log_execution("SUCCESS", news_count, charts_count, "", duration)
-        logger.info(f"Ciclo completato: {news_count} notizie, {charts_count} chart in {duration:.1f}s")
+        db.cleanup_old_news(days=30)
 
     except Exception as e:
+        status = "ERROR"
         error_msg = str(e)
-        duration = time.time() - start_ts
-        db.log_execution("ERROR", news_count, charts_count, error_msg, duration)
-        logger.exception(f"Errore ciclo: {e}")
-        send_telegram_message(f"**ERRORE CICLO**\n\n`{error_msg[:500]}`")
+        logger.error(f"Errore durante il ciclo di esecuzione: {e}", exc_info=True)
+    finally:
+        watchdog.stop()
+        duration = round(time.time() - start_time, 2)
+        db.log_execution(status=status, news_count=news_sent, charts_count=charts_sent,
+                          error_msg=error_msg, duration_sec=duration)
+        logger.info(f"Ciclo completato in {duration}s | Notizie inviate: {news_sent} | Grafici: {charts_sent} | Stato: {status}")
 
-    return news_count, charts_count
 
-def main():
-    logger.info("=" * 50)
-    logger.info("FINANCE NEWS AGENT v5.0 AVVIATO")
-    logger.info("=" * 50)
+def get_memory_usage_mb() -> float:
+    if psutil:
+        try:
+            process = psutil.Process(os.getpid())
+            return round(process.memory_info().rss / (1024 * 1024), 2)
+        except Exception:
+            return 0.0
+    return 0.0
 
-    # Avvia watchdog
-    watchdog.start()
 
-    # Invia messaggio di avvio
+def send_heartbeat(start_time: float, run_count: int):
+    if not CFG.get('heartbeat', {}).get('enabled', True):
+        return
+    interval_runs = CFG['heartbeat'].get('interval_runs', 6)
+    if run_count == 0 or run_count % interval_runs != 0:
+        return
+    mem_mb = get_memory_usage_mb()
+    uptime_hours = round((time.time() - start_time) / 3600, 2)
+    db.log_heartbeat("ALIVE", mem_mb, uptime_hours)
+    logger.info(f"💓 Heartbeat | Uptime: {uptime_hours}h | Memoria: {mem_mb}MB")
     send_telegram_message(
-        f"**Finance News Agent v5.0 Avviato**\n\n"
-        f"**Data:** {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
-        f"**Intervallo:** {RUN_INTERVAL_HOURS}h\n"
-        f"**DB:** {DB_PATH}"
+        f"💓 <b>Agent attivo</b>\nUptime: {uptime_hours}h\nMemoria: {mem_mb}MB\nCicli completati: {run_count}"
     )
 
-    cycle_count = 0
-    hb_cfg = CFG.get('heartbeat', {})
-    hb_interval = hb_cfg.get('interval_runs', 6)
+# ============================================
+# GESTIONE ARRESTO E CICLO DI VITA
+# ============================================
 
-    while True:
-        global WATCHDOG_TRIGGERED
-        if WATCHDOG_TRIGGERED:
-            logger.warning("Watchdog triggered! Riavvio ciclo...")
-            WATCHDOG_TRIGGERED = False
+_stop_event = threading.Event()
 
+
+def _handle_shutdown(signum, frame):
+    logger.info(f"Segnale {signum} ricevuto: arresto in corso...")
+    _stop_event.set()
+
+
+def main():
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    logger.info("=" * 50)
+    logger.info("FINANCE NEWS AGENT v5.0 — avvio")
+    logger.info(f"Intervallo esecuzione: {RUN_INTERVAL_HOURS}h")
+    logger.info("=" * 50)
+
+    start_time = time.time()
+    run_count = 0
+
+    while not _stop_event.is_set():
         try:
             run_cycle()
-            cycle_count += 1
-
-            # Heartbeat DB + Watchdog
-            send_heartbeat()
-
-            # Heartbeat Telegram periodico
-            if cycle_count % hb_interval == 0 and hb_cfg.get('enabled', True):
-                uptime = (time.time() - START_TIME) / 3600
-                send_telegram_message(
-                    f"**Heartbeat**\n\n"
-                    f"Cicli completati: {cycle_count}\n"
-                    f"Uptime: {uptime:.1f}h\n"
-                    f"Prossimo ciclo: {RUN_INTERVAL_HOURS}h"
-                )
-
         except Exception as e:
-            logger.exception(f"Errore grave nel main loop: {e}")
-            send_telegram_message(f"**ERRORE GRAVE**\n\n`{str(e)[:500]}`")
+            logger.error(f"Errore imprevisto nel ciclo principale: {e}", exc_info=True)
+            db.log_execution(status="CRASH", error_msg=str(e))
 
-        # Sleep con check interrupt
+        run_count += 1
+        send_heartbeat(start_time, run_count)
+
+        global WATCHDOG_TRIGGERED
+        if WATCHDOG_TRIGGERED:
+            logger.warning("Riavvio forzato dopo trigger del watchdog")
+            WATCHDOG_TRIGGERED = False
+
         sleep_seconds = RUN_INTERVAL_HOURS * 3600
-        logger.info(f"Sleep per {RUN_INTERVAL_HOURS}h...")
+        logger.info(f"In attesa del prossimo ciclo tra {RUN_INTERVAL_HOURS}h...")
+        elapsed = 0
+        while elapsed < sleep_seconds and not _stop_event.is_set():
+            time.sleep(min(30, sleep_seconds - elapsed))
+            elapsed += 30
 
-        for _ in range(sleep_seconds):
-            if WATCHDOG_TRIGGERED:
-                break
-            time.sleep(1)
+    logger.info("Agent arrestato correttamente.")
+
 
 if __name__ == "__main__":
-    # Gestione segnali
-    def signal_handler(signum, frame):
-        logger.info("Segnale di arresto ricevuto")
-        watchdog.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
     main()
-
