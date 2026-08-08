@@ -484,7 +484,8 @@ class Database:
 
     def save_prediction(self, ticker: str, company_name: str, strategy: str, entry: float,
                        target_1: float, target_2: float, target_3: float, stop_loss: float,
-                       confidence: int, confidence_reason: str, position: str, valid_until: str):
+                       confidence: int, confidence_reason: str, position: str, valid_until: str,
+                       hold_days: int = 7):
         with self._lock:
             with self._connect() as conn:
                 c = conn.cursor()
